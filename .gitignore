@@ -1,0 +1,36 @@
+# --- Binarios y Objetos de C ---
+*.o
+*.so
+*.elf
+# Ignora los ejecutables finales (añade aquí los nombres de tus binarios)
+/bridge_user
+/bridge_kern
+/server
+/client
+/logger*
+
+# --- Archivos generados por eBPF ---
+# Los archivos .o generados por clang para eBPF
+*_kern.o
+*_user.o
+
+# --- Python ---
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+env/
+venv/
+
+# --- Logs y archivos de salida de Mininet ---
+*.log
+*.out
+*.txt
+/tmp/mininet-*
+
+# --- Editores y Sistema ---
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
