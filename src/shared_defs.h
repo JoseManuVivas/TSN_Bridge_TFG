@@ -1,0 +1,8 @@
+#ifndef SHARED_DEFS_H
+#define SHARED_DEFS_H
+
+#define NUM_QUEUES 64
+#define NUM_FRAMES 4096
+#define FRAME_SIZE 2048
+
+#endif // SHARED_DEFS_H
