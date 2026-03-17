@@ -103,3 +103,27 @@ sudo ip link set dev s1-eth1 xdp off
 
 #### Fuentes consultadas
 - **Referencia:** [Documentación oficial de AF_XDP](https://docs.kernel.org/networking/af_xdp.html) — Documentación oficial del Kernel sobre la arquitectura de anillos y gestión de memoria UMEM en AF_XDP.
+
+## Sesión [17-03-2026]
+### Canal de comunicación entre el Kernel y espacio de usuario
+**Objetivo:** Conseguir que el programa XDP redirija el flujo a un programa de espacio de usuario y comunicar los datos utilizando mapas.
+
+#### Tareas realizadas
+- En `bridge_user.c` hemos construido la función `configure_xsk_umem` que inicializa todas las estructuras necesarias para tratar con la UMEM.
+
+#### Notas técnicas
+- La llamada `xsk_umem_create` no reserva la memoria de `buffer`, esta tiene que ser reservada de antemano. Lo que hace esta llamada con la dirección a la que apunta `buffer` es "proteger" la memoria desde `buffer` hasta `size` como, por ejemplo, haciendo que las páginas de memoria donde está nunca vayan al disco y siempre estén en la RAM física.
+
+- La función `calloc` es la versión limpia de `malloc`. Rellena la memoria reservada con ceros para evitar basura.
+
+- Un recordatorio de C. Cuando definimos una estructura en una función que queremos usar fuera de esta hay que definir un puntero y luego reservar memoria para la estructura. ¿Por qué? Porque dentro de una función las variables se crean en la pila, la cual se destruye cuando se sale de la función. Sin embargo las llamadas de reserva de memoria dinámica la reservan en el heap, un espacio de memoria extenso que puede accederse fuera de la función también.
+
+- La gestión de frames(memoria) en un Bridge de dos puertos (pongamos Sockets A y B) es la historia del traspaso de propiedades entre programa de usuario y Kernel y entre sockets. Describámoslo así, en el proceso de un paquete entrando por el socket A y saliendo por el socket B.
+
+    1. Inicialmente, repartimos la propiedad de los frames entre los dos sockets, de forma que uno de ellos no tenga inanición. Recordemos que el Fill Ring sirve para transmitir la propiedad de los frames del programa de usuario al Kernel. Por ello, podemos suponer que, de 4096 frames, de las direcciones 1 a la 2048 serán del Socket A y de la 2049 a la 4096 serán del Socket B. Así, cada Socket rellenará su estructura `umem_frame_addr` con las direcciones que le tocan. Una vez hecho esto, el programa de usuario rellenará con sus direcciones libres el Fill Ring para que el Kernel pueda utilizar todas esas direcciones. La estructura `umem_frame_free` sirve para identificar la última dirección de un frame libre. ¿Pero a qué nos referimos con un frame libre? Es un frame que el programa de usuario (que es el que crea la UMEM) puede "prestar al Kernel". Todo esto se hace al principio y a medida que llenamos el fill ring va disminuyendo el número de "frames libres", porque "ya han sido prestados". los correspondientes a cada socket, claro.
+    2. Llega un paquete al Kernel a través de la interfaz física asociada al Socket A. El Kernel busca en el Fill Ring la primera dirección disponible. El Kernel escribe los datos del paquete en ese frame y coloca un descriptor a esa dirección en el RX Ring. La propiedad vuelve al programa de usuario
+    3. El frame todavía no se puede conceder al Kernel debido a que lo está usando el programa de usuario. Una vez lo procesa lo escribe en el TX Ring del Socket B. La propiedad del frame vuelve al Kernel.
+    4. El driver de la tarjeta de red lee el TX Ring y reenvía el paquete. Cuando lo hace, escribe un descriptor de dicho en el Completion Ring. La propiedad vuelve al programa de usuario.
+    5. El programa de usuario ve que hay un nuevo frame en el Completion Ring y descubre que ese frame está de nuevo libre, porque el paquete ya ha viajado por todas las interfaces. Verifica la dirección a cuál de los dos sockets A o B correspondía y lo añade a su lista de libres. El frame vuelve a estar disponible para ser usado cuando sea necesario.
+
+- El pre-decremento (por ejemplo, `xsk->umem_frame_addr[--xsk->umem_frame_free]`) es una joyita de C que, primero decrementa el valor de la variable y luego la usa. Es muy útil en casos como el expuesto, porque matemáticamente el último frame libre no es el índice del vector, es uno menos y al mismo tiempo, el restarle 1 permite tenerlo ya decrementado para el siguiente uso.
