@@ -109,7 +109,7 @@ sudo ip link set dev s1-eth1 xdp off
 **Objetivo:** Conseguir que el programa XDP redirija el flujo a un programa de espacio de usuario y comunicar los datos utilizando mapas.
 
 #### Tareas realizadas
-- En `bridge_user.c` hemos construido la función `configure_xsk_umem` que inicializa todas las estructuras necesarias para tratar con la UMEM.
+- En `bridge_user.c` hemos construido la función `configure_xsk_umem` que inicializa todas las estructuras necesarias para tratar con la UMEM y hemos definido las estructuras correspondientes al socket XSK y las funciones para liberar y solicitar frames: `xsk_alloc_umem_frame` y `xsk_free_umem_frame`.
 
 #### Notas técnicas
 - La llamada `xsk_umem_create` no reserva la memoria de `buffer`, esta tiene que ser reservada de antemano. Lo que hace esta llamada con la dirección a la que apunta `buffer` es "proteger" la memoria desde `buffer` hasta `size` como, por ejemplo, haciendo que las páginas de memoria donde está nunca vayan al disco y siempre estén en la RAM física.
