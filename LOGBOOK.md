@@ -127,3 +127,10 @@ sudo ip link set dev s1-eth1 xdp off
     5. El programa de usuario ve que hay un nuevo frame en el Completion Ring y descubre que ese frame está de nuevo libre, porque el paquete ya ha viajado por todas las interfaces. Verifica la dirección a cuál de los dos sockets A o B correspondía y lo añade a su lista de libres. El frame vuelve a estar disponible para ser usado cuando sea necesario.
 
 - El pre-decremento (por ejemplo, `xsk->umem_frame_addr[--xsk->umem_frame_free]`) es una joyita de C que, primero decrementa el valor de la variable y luego la usa. Es muy útil en casos como el expuesto, porque matemáticamente el último frame libre no es el índice del vector, es uno menos y al mismo tiempo, el restarle 1 permite tenerlo ya decrementado para el siguiente uso.
+
+## Sesión [18-03-2026]
+### Canal de comunicación entre el Kernel y espacio de usuario
+**Objetivo:** Conseguir que el programa XDP redirija el flujo a un programa de espacio de usuario y comunicar los datos utilizando mapas.
+
+#### Notas técnicas
+- El flag `XDP_FLAGS_SKB_MODE` obliga al Kernel a procesar el paquete XDP siguiendo el stack genérico de red en lugar de ejecutar el programa XDP directamente en el driver. Esto es necesario debido a que vamos a trabajar con interfaces virtuales de Mininet las cuales no disponen de un driver que soporte XDP. Es más lento pero se puede emular en cualquier ordenador-
