@@ -132,5 +132,41 @@ sudo ip link set dev s1-eth1 xdp off
 ### Canal de comunicación entre el Kernel y espacio de usuario
 **Objetivo:** Conseguir que el programa XDP redirija el flujo a un programa de espacio de usuario y comunicar los datos utilizando mapas.
 
+#### Tareas realizadas
+- Programada función `xsk_configure_socket` que inicializa todo lo necesario para que pueda utilizarse un socket AF_XDP. Entre otros registra todos los frames de los que dispone y concede los adecuados al Kernel mediante el Fill Ring.
+- Programada función `process_rx_and_forward` que se encarga de la operación de transmitir los descriptores entre el RX y el TX
+- Programada función `handle_tx_completion` que devuelve a la pila del socket correspondiente los frames que ya han terminado su función al haber el Kernel terminado de reenviar el paquete correspondiente.
+- Programada función `handle_fill_ring` que sirve para provisionar al fill ring de frames que aun queden libres en las pilas de cada socket.
+- Se ha empezado a programar el `main`
+
 #### Notas técnicas
-- El flag `XDP_FLAGS_SKB_MODE` obliga al Kernel a procesar el paquete XDP siguiendo el stack genérico de red en lugar de ejecutar el programa XDP directamente en el driver. Esto es necesario debido a que vamos a trabajar con interfaces virtuales de Mininet las cuales no disponen de un driver que soporte XDP. Es más lento pero se puede emular en cualquier ordenador-
+- El flag `XDP_FLAGS_SKB_MODE` obliga al Kernel a procesar el paquete XDP siguiendo el stack genérico de red en lugar de ejecutar el programa XDP directamente en el driver. Esto es necesario debido a que vamos a trabajar con interfaces virtuales de Mininet las cuales no disponen de un driver que soporte XDP. Es más lento pero se puede emular en cualquier ordenador.
+
+- Lo que se almacena en la estructura `umem_frame_addr` son offsets, es decir, desplazamientos dentro de la UMEM, el desplazamiento desde el inicio de la UMEM para cada frame.
+
+- Recordatorio de C. El operador `*` sirve para desreferenciar, es decir, cambia el valor de la dirección de memoria a la que apunta por "el cajón" al que apunta. Permite asignar valores a lo que apuntan los punteros.
+
+- Tanto el RX Ring como el TX Ring lo que almacenan son descriptores, es decir: estructuras que guardan la dirección de inicio del paquete en este caso y su longitud. Es lo que estamos traspasando con la función `process_rx_and_forward`
+
+- En la función `process_rx_and_forward` estamos haciendo un truco para despertar al Kernel y avisarle de que tiene paquetes disponibles, que es utilizar `sendto` con un paquete vacío (y el flag `MSG_DONTWAIT`). Es una forma de "forzar" una syscall, sin que el Kernel vaya a hacer nada realmente porque priorizará la labor de transmisión de paquetes.
+
+- El Kernel de Linux y la NIC utilizan una técnica llamada DMA para transferir datos directamente entre memoria y programa sin pasar por la CPU. Esta tecnología exige que la dirección de inicio del bloque de datos a transferir esté alineada con el comienzo de una página. Además, lo ideal es que el número de frames dentro de una página sea potencia de 2, para ganar rendimiento, ya que si un frame formara parte de dos páginas al mismo tiempo el rendimiento caería en picado. Ahora, otra clave es que el tamaño del frame también es un compromiso. Con un frame más pequeño te caben más en una página, pero por otro lado te arriesgas a que un paquete muy grande no quepa en un frame (y directamente el programa no funcionaría). Es por eso por lo que se ha optado directamente por un frame por página.
+
+## Sesión [19-03-2026]
+### Canal de comunicación entre el Kernel y espacio de usuario
+**Objetivo:** Conseguir que el programa XDP redirija el flujo a un programa de espacio de usuario y comunicar los datos utilizando mapas.
+
+#### Tareas realizadas
+- Hemos cambiado la key del `XSKMAP` de la cola de la interfaz por la que ha entrado al propio índice de la interfaz por la que ha entrado.
+
+- Función `main` completada (falta testear).
+
+#### Notas técnicas
+- Recordatorio de C: librerías `stdio`, `stdlib` y `unistd`:
+    - `stdio` es la librería de usuario que se encarga de la entrada y salida de forma amigable
+    - `stdlib` es la "caja de herramientas" general de la librería estándar para usuario
+    - `unistd`(Unix Standard) es la librería de bajo nivel. No "envuelve" nada, proporciona las syscalls en su versión más pura.
+
+- Volantazo: Para indexar los sockets en el mapa, en lugar de usar las colas (dado que para los dos sockets la cola es la misma), usaremos los índices de las interfaces.
+
+- El flag `BPF_ANY` es el más permisivo a la hora de insertar en un mapa. Permite que si un elemento asociado a una llave (o la misma llave) existe, lo cree y que si ya existe lo machaque.

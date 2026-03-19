@@ -4,5 +4,6 @@
 #define NUM_QUEUES 64
 #define NUM_FRAMES 4096
 #define FRAME_SIZE 2048
+#define MAX_SOCKETS 1024
 
 #endif // SHARED_DEFS_H

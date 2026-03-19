@@ -6,6 +6,10 @@
 #include <sys/socket.h>
 #include <signal.h>
 #include <poll.h>
+#include <unistd.h>
+#include <net/if.h>
+#include <stdio.h>
+#include <stdlib.h>
 #include "shared_defs.h"
 
 static bool exiting = false;
@@ -301,4 +305,108 @@ int main(int argc, char **argv)
         fprintf(stderr, "Error reservando memoria alineada\n");
         return 1;
     }
-}
+
+    // Inicializamos la UMEM
+    struct xsk_umem_info *umem = configure_xsk_umem(buffer, buffer_size);
+    if (!umem) {
+        fprintf(stderr, "Error inicializando la UMEM\n");
+        return 1;
+    }
+
+    // Configuramos los dos sockets(puertos del bridge)
+    // (hardcodeamos el nombre de las interfaces)
+    struct xsk_socket_info *xsk_A = xsk_configure_socket(umem, "s1-eth1", 0, 0);
+    struct xsk_socket_info *xsk_B = xsk_configure_socket(umem, "s1-eth2", 0, (NUM_FRAMES / 2) * FRAME_SIZE);
+
+    if (!xsk_A || !xsk_B) {
+        fprintf(stderr, "Error inicializando los sockets\n");
+        return 1;
+    }
+
+    // Cargar el programa XDP
+    struct xdp_program *prog = xdp_program__open_file("bridge_kern.o", "bridge_prog", NULL);
+    if (!prog) {
+        fprintf(stderr, "Error al abrir el programa BPF bridge_kern.o\n");
+        return 1;
+    }
+
+    // Attach en modo SKB, el compatible con Mininet
+    xdp_program__attach(prog, if_nametoindex("s1-eth1"), XDP_MODE_SKB, 0);
+    xdp_program__attach(prog, if_nametoindex("s1-eth2"), XDP_MODE_SKB, 0);
+
+    // Buscamos el mapa (el nombre del mapa esta hardcodeado)
+    int map_fd = bpf_map__fd(xdp_program__find_map_by_name(prog, "xsk_map"));
+    if (map_fd < 0) {
+        fprintf(stderr, "Error: No se encontró el mapa xsk_map en el programa BPF\n");
+        return 1;
+    }
+
+    // Vinculamos cada socket al mapa usando el ifindex como llave
+    uint32_t key_A = if_nametoindex("s1-eth1");
+    uint32_t key_B = if_nametoindex("s1-eth2");
+
+    // Obtenemos los descriptores de cada socket
+    int fd_A = xsk_socket__fd(xsk_A->xsk);
+    int fd_B = xsk_socket__fd(xsk_B->xsk);
+
+    if (bpf_map_update_elem(map_fd, &key_A, &fd_A, BPF_ANY) ||
+        bpf_map_update_elem(map_fd, &key_B, &fd_B, BPF_ANY)) {
+        fprintf(stderr, "Error actualizando el mapa XSKMAP\n");
+        return 1;
+    }
+
+    // Configuramos el sistema de polling
+    struct pollfd fds[2] = {0};
+    fds[0].fd = fd_A;
+    fds[0].events = POLLIN;
+    fds[1].fd = fd_B;
+    fds[1].events = POLLIN;
+
+    printf("Bridge AF_XDP iniciado entre s1-eth1, de ifindex %u, y s1-eth2, de ifindex %u\n", key_A, key_B);
+    printf("Presiona Ctrl+C para salir...\n");
+
+    // Bucle principal de reenvío
+    while (!exiting) {
+        // Esperamos o 100ms o a que haya actividad en alguno de los sockets
+        int ret = poll(fds, 2, 100);
+
+        if (ret <= 0) continue;
+
+        // Si entra por A lo mandamos por B y si entra por B lo mandamos por A
+        if (fds[0].revents & POLLIN) {
+            process_rx_and_forward(xsk_A, xsk_B);
+        }
+
+        if (fds[1].revents & POLLIN) {
+            process_rx_and_forward(xsk_B, xsk_A);
+        }
+
+        // Mantenimiento: revisamos el Completion Ring y recauchutamos el Fill Ring
+        handle_tx_completion(xsk_A, xsk_B);
+        handle_fill_ring(xsk_A);
+        handle_fill_ring(xsk_B);
+    }
+
+    // Limpieza final
+    printf("Cerrando Bridge y limpiando recursos...\n");
+
+    // Desvinculamos el programa XDP de las interfaces
+    xdp_program__detach(prog, if_nametoindex("s1-eth1"), XDP_MODE_SKB, 0);
+    xdp_program__detach(prog, if_nametoindex("s1-eth2"), XDP_MODE_SKB, 0);
+
+    // Eliminamos los sockets
+    xsk_socket__delete(xsk_A->xsk);
+    xsk_socket__delete(xsk_B->xsk);
+
+    // Liberamos la UMEM
+    xsk_umem__delete(umem->umem);
+
+    // Liberamos la memoria de las estructuras
+    free(buffer);
+    free(xsk_A);
+    free(xsk_B);
+    free(umem);
+
+    printf("Limpieza finalizada. ¡¡Adios!!\n");
+    return 0;
+} 
