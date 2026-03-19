@@ -28,6 +28,9 @@ venv/
 *.txt
 /tmp/mininet-*
 
+# Carpeta de construcción
+build/
+
 # --- Editores y Sistema ---
 .vscode/
 .idea/

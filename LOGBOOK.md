@@ -170,3 +170,36 @@ sudo ip link set dev s1-eth1 xdp off
 - Volantazo: Para indexar los sockets en el mapa, en lugar de usar las colas (dado que para los dos sockets la cola es la misma), usaremos los índices de las interfaces.
 
 - El flag `BPF_ANY` es el más permisivo a la hora de insertar en un mapa. Permite que si un elemento asociado a una llave (o la misma llave) existe, lo cree y que si ya existe lo machaque.
+
+- Ha dado error de compilación en la función `xsk_ring_prod__nb_free`. Por lo visto no está definida en mi versión de `libxdp`. Para arreglarlo, simplemente eliminamos su comprobación y listo, con la de reserva es suficiente.
+
+- Un error bastante estúpido que era liberar la memoria de la estructura `xsk_info` antes de eliminar el socket al que apuntaba.
+
+- Además tenía que corregir cual era la ruta para obtener el mapa. Primero se debía obtener el `bpf_object` que contiene el programa, luego buscar el mapa dentro de ese objeto y luego obtener el descriptor de ese mapa.
+
+#### REPORTE DE LA PRIMERA EJECUCIÓN
+- Tras poder compilar se ha ejecutado el bridge. Ha fallado, dando error de fallo al inicializar los sockets. Para depurar se incluirá el siguiente print de error:
+    - `fprintf(stderr, "Fallo en %s: %s (errno: %d)\n", ifname, strerror(errno), errno);`
+
+- Vale, pudiendo depurar se ha obtenido que el error era del socket B llamado `Bad address`. Presumiblemente es porque el offset de su UMEM se sale de los límites.
+
+- No es eso, porque hemos comprobado a poner de offset 0 también al socket B y sigue sin ir. Es posible que el problema sea al cebar el Fill Ring mientras estamos creando un socket, ya que hay otro abierto que puede que lo esté utilizando. Vamos a aislar la creación del socket y el cebado del Fill Ring.
+
+- Se ha intentado el aislamiento y sigue dando error de Bad Address. El problema parece ser que los drivers virtuales de Mininet no permiten una UMEM compartida para dos interfaces de red distintas. El modo shared_umem se hizo pensando en las distintas colas de un mismo dispositivo de red. Por lo tanto, lo que se va a hacer va a ser una UMEM para cada interfaz. La función de `configure_xsk_umem` se va a la mierda.
+
+- Después de haber implementado el aislamiento y la UMEM para cada socket correctamente (cada socket está asociado a una interfaz), el programa ha logrado ejecutarse, pero no conseguí que el ping fuera y después de unos segundos me ha dado el fatídico Kernel Panic. El motivo probablemente fuera porque los dos sockets compartían el mismo mapa y al estar en interfaces diferentes pues lo volvía loco, ya que el ifindex podía ser el que le saliera del níspero a Mininet.
+
+- Creando dos mapas y cargando un programas XDP en cada interfaz, aunque el ping sigue sin funcionar, ya no da Kernel Panic. Vamos a depurar por qué no se completa el ping.
+
+- Esto es interesante. El mensaje de debug nos revela que los paquetes se están capturando, pero el ping no se completa.
+
+- No ha habido suerte y han vuelto a dar Kernel Panics. Se sospechaba que podía ser por un offset que añade el Kernel al propio frame como espacio para cabeceras pero no ha sido así.
+
+#### Comandos clave
+```bash
+# Comando para ver los enlaces de mininet
+mininet> links
+
+# Comando para abrir dos terminales en cada uno de los hosts
+mininet> xterm h1 h2
+```

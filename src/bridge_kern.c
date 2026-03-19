@@ -17,8 +17,6 @@ struct hdr_cursor {
 
 SEC("xdp")
 int bridge_prog(struct xdp_md *ctx) {
-    // Primero obtenemos el índice del mapa del socket XSK correspondiente a la cola
-    __u32 index = ctx->ingress_ifindex; // Índice de la interfaz de entrada
 
     // Verificación de tamaño de paquete para que sea superior al tamaño mínimo de Ethernet
     // Para castear a void, primero convertimos a long ya que en x86_64 los punteros son de 64 bits y los de la estructura xdp_md son de 32 bits
@@ -28,7 +26,8 @@ int bridge_prog(struct xdp_md *ctx) {
         return XDP_PASS;
     }
 
-    return bpf_redirect_map(&xsk_map, index, XDP_PASS); // Redirigimos el paquete al socket XSK correspondiente
+    // Redirigiremos siempre al índice de la interfaz
+    return bpf_redirect_map(&xsk_map, ctx->ingress_ifindex, XDP_DROP); // Redirigimos el paquete al socket XSK correspondiente
 }
 
 
