@@ -2,6 +2,8 @@ from mininet.topo import Topo
 from mininet.net import Mininet
 from mininet.cli import CLI
 from mininet.node import Host
+from mininet.node import OVSSwitch
+from mininet.nodelib import LinuxBridge
 
 # Esta es la pieza que crea las etiquetas VLAN. No la toques, 
 # es la que hace que el Host 1 mande paquetes con "etiqueta 10".
@@ -21,7 +23,7 @@ class VLANHost( Host ):
 class MyTopology(Topo):
     def build(self):
         # 1. Creamos el Bridge (que para Mininet es un Switch)
-        s1 = self.addSwitch('s1')
+        s1 = self.addSwitch('s1', cls=LinuxBridge) 
 
         # 2. Creamos dos Hosts con VLAN 10
         h1 = self.addHost('h1', ip='10.0.0.1/24') # Sin cls=VLANHost

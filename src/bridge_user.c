@@ -93,8 +93,16 @@ static struct xsk_socket_info *xsk_configure_socket(const char *ifname)
     xsk_info->umem = calloc(1, sizeof(struct xsk_umem_info));
     xsk_info->umem->buffer = buffer;
 
+    struct xsk_umem_config umem_cfg = {
+        .fill_size = XSK_RING_PROD__DEFAULT_NUM_DESCS,
+        .comp_size = XSK_RING_CONS__DEFAULT_NUM_DESCS,
+        .frame_size = FRAME_SIZE,
+        .frame_headroom = 256, // Le exigimos los 256 de headroom
+        .flags = 0
+    };
+
     ret = xsk_umem__create(&xsk_info->umem->umem, buffer, buffer_size, 
-                           &xsk_info->umem->fq, &xsk_info->umem->cq, NULL);
+                           &xsk_info->umem->fq, &xsk_info->umem->cq, &umem_cfg);
     if (ret) return NULL;
 
     // Asignamos los flags de configuración del socket
@@ -137,26 +145,24 @@ static struct xsk_socket_info *xsk_configure_socket(const char *ifname)
 static void handle_fill_ring(struct xsk_socket_info *xsk)
 {
     uint32_t idx;
-    unsigned int i, to_fill;
+    
+    // Miramos exactamente cuántos frames nos quedan libres
+    unsigned int to_fill = xsk->umem_frame_free;
+    if (to_fill > 64) to_fill = 64; // Tope de 64 por ráfaga
+    if (to_fill == 0) return; // Si no hay libres, no hacemos nada
 
-    to_fill = 64; // tamaño de ráfaga bastante común
-    // Reservamos esos huecos en el Fill Ring
+    // Reservamos EXACTAMENTE los que vamos a usar
     if (xsk_ring_prod__reserve(&xsk->umem->fq, to_fill, &idx) != to_fill)
         return;
 
-    // Vamos retirando los frames de nuestra pila y añadiendolos al Fill Ring
-    for (i = 0; i < to_fill; i++) {
-
-        // Sacamos la dirección del frame libre
+    // Rellenamos (ahora sabemos seguro que no fallará el alloc)
+    for (unsigned int i = 0; i < to_fill; i++) {
         uint64_t addr = xsk_alloc_umem_frame(xsk);
-        if (addr == UINT64_MAX) break; // Por si nos quedamos sin frames en la pila
-        
-        // Añadimos la dirección al Fill Ring
         *xsk_ring_prod__fill_addr(&xsk->umem->fq, idx++) = addr;
     }
 
-    // Hacemos commit
-    xsk_ring_prod__submit(&xsk->umem->fq, i);
+    // 4. Hacemos commit del total sin desfases
+    xsk_ring_prod__submit(&xsk->umem->fq, to_fill);
 }
 
 // Función para revisar el Completion Ring de un socket y devolver los frames pertinentes a la pila del socket
@@ -175,7 +181,9 @@ static void handle_tx_completion(struct xsk_socket_info *xsk)
         // Obtenemos la dirección del primer frame completado
         uint64_t addr = *xsk_ring_cons__comp_addr(&xsk->umem->cq, idx_cq++);
    
-        xsk_free_umem_frame(xsk, addr);
+        uint64_t clean_addr = addr & ~((uint64_t)FRAME_SIZE - 1);
+
+        xsk_free_umem_frame(xsk, clean_addr);
         // No nos olvidemos de actualizar el contador de frames pendientes de enviar
         if (xsk->outstanding_tx > 0) xsk->outstanding_tx--;
 
@@ -194,78 +202,58 @@ static void process_rx_and_forward(struct xsk_socket_info *rx_socket,
     uint32_t idx_rx, idx_tx;
     unsigned int rcvd, packets_to_submit = 0;
 
-    // Miramos si hay paquetes esperando en el RX Ring del socket A
-    // Tomaremos como máximo ráfagas de 64 paquetes
     rcvd = xsk_ring_cons__peek(&rx_socket->rx, 64, &idx_rx);
-    if (!rcvd) {
-        // No hay paquetes por procesar
-        return;
-    }
+    if (!rcvd) return;
 
-    printf("DEBUG: He capturado %u paquetes. Reenvio\n", rcvd);
-
-    // Intentamos reservar el mismo número de entradas en el TX Ring del socket B
-    if (xsk_ring_prod__reserve(&tx_socket->tx, rcvd, &idx_tx) != rcvd) {
-
-        // Si no hay espacio lo que mas cunde es liberar el RX Ring para no bloquear
-        // Mejor perder paquetes que mandar a la mierda el programa
-        xsk_ring_cons__release(&rx_socket->rx, rcvd);
-        return;
-    }
-
-    // Copia de frames de la UMEM del socket RX al socket TX, actualizando los descriptores del TX Ring
     for (unsigned int i = 0; i < rcvd; i++) {
-
-        // Definimos los descriptores de RX y TX para este paquete
         const struct xdp_desc *rx_desc = xsk_ring_cons__rx_desc(&rx_socket->rx, idx_rx++);
-
-        // ¡¡LA MAGIA NEGRA!! Limpiamos la dirección (le quitamos el offset) para no envenenar el Kernel
         uint64_t clean_rx_addr = rx_desc->addr & ~((uint64_t)FRAME_SIZE - 1);
 
-        // Comprobación de seguridad
         if (rx_desc->len > FRAME_SIZE || rx_desc->len == 0) {
-            xsk_free_umem_frame(rx_socket, clean_rx_addr); // Usamos la limpia
+            xsk_free_umem_frame(rx_socket, clean_rx_addr);
             continue; 
         }
 
-        struct xdp_desc *tx_desc = xsk_ring_prod__tx_desc(&tx_socket->tx, idx_tx++);
-
-        // Para LEER los datos, SÍ usamos la original (con el offset)
-        void *rx_data = xsk_umem__get_data(rx_socket->umem->buffer, rx_desc->addr);
-        
+        // Intentamos sacar memoria NUEVA primero
         uint64_t new_addr = xsk_alloc_umem_frame(tx_socket);
         if (new_addr == UINT64_MAX) {
-            xsk_free_umem_frame(rx_socket, clean_rx_addr); // Usamos la limpia
-            break; 
+            xsk_free_umem_frame(rx_socket, clean_rx_addr);
+            continue; // Si no hay memoria, tiramos el paquete, pero NO rompemos el anillo
         }
         
-        void *tx_data = xsk_umem__get_data(tx_socket->umem->buffer, new_addr);
+        // AHORA reservamos 1 solo hueco en el anillo TX
+        if (xsk_ring_prod__reserve(&tx_socket->tx, 1, &idx_tx) != 1) {
+            xsk_free_umem_frame(tx_socket, new_addr); // Devolvemos la memoria nueva
+            xsk_free_umem_frame(rx_socket, clean_rx_addr); // Devolvemos la vieja
+            continue;
+        }
 
-        // Copiamos el contenido
+        struct xdp_desc *tx_desc = xsk_ring_prod__tx_desc(&tx_socket->tx, idx_tx);
+        uint64_t tx_addr = new_addr + 256; // El margen vital
+
+        void *rx_data = xsk_umem__get_data(rx_socket->umem->buffer, rx_desc->addr);
+        void *tx_data = xsk_umem__get_data(tx_socket->umem->buffer, tx_addr);
+
         memcpy(tx_data, rx_data, rx_desc->len);
 
-        // Configuramos TX (las nuevas direcciones siempre están limpias de serie)
-        tx_desc->addr = new_addr;
+        tx_desc->addr = tx_addr;
         tx_desc->len = rx_desc->len;
 
         packets_to_submit++;
         tx_socket->outstanding_tx++;
         
-        // Devolvemos LA LIMPIA a nuestra UMEM
         xsk_free_umem_frame(rx_socket, clean_rx_addr);
     }
 
-    // Liberamos los descriptores del RX Ring
     xsk_ring_cons__release(&rx_socket->rx, rcvd);
 
-    // ENVIAMOS SOLO LO QUE HEMOS ESCRITO
+    // 3. Enviamos la suma exacta de lo que hemos procesado
     if (packets_to_submit > 0) {
         xsk_ring_prod__submit(&tx_socket->tx, packets_to_submit);
         if (xsk_ring_prod__needs_wakeup(&tx_socket->tx)) {
             sendto(xsk_socket__fd(tx_socket->xsk), NULL, 0, MSG_DONTWAIT, NULL, 0);
         }
     }
-
 }
 
 int main() {
@@ -274,8 +262,8 @@ int main() {
     signal(SIGINT, signal_handler);
 
     // Definimos los dos sockets
-    struct xsk_socket_info *xsk_A = xsk_configure_socket("s1-eth1");
-    struct xsk_socket_info *xsk_B = xsk_configure_socket("s1-eth2");
+    struct xsk_socket_info *xsk_A = xsk_configure_socket("dummy0");
+    struct xsk_socket_info *xsk_B = xsk_configure_socket("dummy1");
 
     if (!xsk_A || !xsk_B) {
         fprintf(stderr, "Error inicializando sockets. ¿Ulimit? ¿Interfaces?\n");
@@ -290,23 +278,23 @@ int main() {
 
     // Cargamos dos programas XDP, uno por interfaz, asignándoles el socket correspondiente y creándoles un mapa
     struct xdp_program *prog_A = xdp_program__open_file("build/bridge_kern.o", "xdp", NULL);
-    xdp_program__attach(prog_A, if_nametoindex("s1-eth1"), XDP_MODE_SKB, 0);
+    xdp_program__attach(prog_A, if_nametoindex("dummy0"), XDP_MODE_SKB, 0);
     
     // MAPA A
     // Obtener el mapa exclusivo del Programa A y poner el Socket A en el índice 0
     int map_fd_A = bpf_map__fd(bpf_object__find_map_by_name(xdp_program__bpf_obj(prog_A), "xsk_map"));
-    uint32_t key = if_nametoindex("s1-eth1"); // Índice de la interfaz s1-eth1, que es el que usará el programa A para redirigir los paquetes
+    uint32_t key = if_nametoindex("dummy0"); // Índice de la interfaz dummy0, que es el que usará el programa A para redirigir los paquetes
     int fd_A = xsk_socket__fd(xsk_A->xsk);
     bpf_map_update_elem(map_fd_A, &key, &fd_A, BPF_ANY);
 
     // MAPA B
     // Al llamar a open_file otra vez, creamos una SEGUNDA instancia de todo
     struct xdp_program *prog_B = xdp_program__open_file("build/bridge_kern.o", "xdp", NULL);
-    xdp_program__attach(prog_B, if_nametoindex("s1-eth2"), XDP_MODE_SKB, 0);
+    xdp_program__attach(prog_B, if_nametoindex("dummy1"), XDP_MODE_SKB, 0);
     
     // Obtener el mapa exclusivo del Programa B y poner el Socket B en el índice 0
     int map_fd_B = bpf_map__fd(bpf_object__find_map_by_name(xdp_program__bpf_obj(prog_B), "xsk_map"));
-    key = if_nametoindex("s1-eth2"); // Índice de la interfaz s1-eth2
+    key = if_nametoindex("dummy1"); // Índice de la interfaz dummy1
     int fd_B = xsk_socket__fd(xsk_B->xsk);
     bpf_map_update_elem(map_fd_B, &key, &fd_B, BPF_ANY);
 
