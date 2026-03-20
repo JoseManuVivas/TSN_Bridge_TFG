@@ -203,3 +203,38 @@ mininet> links
 # Comando para abrir dos terminales en cada uno de los hosts
 mininet> xterm h1 h2
 ```
+
+## Sesión [20-03-2026]
+### Diagnóstico de Estabilidad y resolución del Kernel Panic en AF_XDP
+**Objetivo:** Aislar, diagnosticar y resolver el fallo fatal del sistema (`Fatal exception from interrupt`/Kernel Panic) que ocurría al arrancar el programa de usuario `bridge_user.c`.
+
+### Tareas realizadas
+- Análisis de logs: `dmesg/journalctl`. Se analizó el volcado de memoria de sesiones previas utilizando `journalctl -b -1 -r` para identificar el origen del cuelgue del sistema. Se confirmó que el pánico no era un error de segmentación sino una excepción fatal en contexto `softirq` del Kernel.
+
+- Implementación de la Alineación de Memoria: Se modificó la lógica de recepción para confirmar que cualquier dirección extraída del anillo RX estuviera alineada perfectamente al inicio del frame antes de liberarla a la UMEM del otro socket.
+
+- Aislamiento del entorno: Linux Bridge vs OVS: Se modificó el script `topo.py` de Mininet para reemplazar `OVSSwitch` por el `LinuxBridge` nativo buscando el mismo datapath que el Kernel.
+
+- Se rediseñaron las funciones `handle_fill_ring` y `process_rx_and_forward` para que las operaciones de reserva de huecos para frames y envío siempre reservaran el tamaño exacto de frames disponibles para utilizar evitando dejar huecos en los anillos.
+
+- Se eliminó la configuración por defecto en la creación de la UMEM con `xsk_umem__create` que, al utilizar `NULL` forzaba frames de 4096 cuando habíamos definido como tamaño de frame 2048.
+
+- A la hora de retransmitir los paquetes se implementó la suma del margen de 256 para dar espacio a las estructuras que añade el Kernel de Linux al crear el `skb`.
+
+- Prueba de interfaces Dummy: Para descartar un fallo propio del código de C se ejecutó el programa `bridge_user` sobre interfaces `dummy` de Linux, con las que no daba Kernel Panic.
+
+#### Comandos clave
+```bash
+# Comando para buscar el Call Trace de sesiones previas al provocarse el Kernel Panic
+sudo journalctl -b -1 -r | grep -iA 50 "Oops\|panic\|Exception"
+
+# Creación manual de interfaces dummy
+sudo ip link add dummy0 type dummy
+sudo ip link add dummy1 type dummy
+sudo ip link set dummy0 up
+sudo ip link set dummy1 up
+
+# Comando para inyectar tráfico artificial en una interfaz sin esperar respuesta
+ping -I dummy0 8.8.8.8
+
+```
