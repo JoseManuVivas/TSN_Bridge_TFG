@@ -45,17 +45,17 @@ if __name__ == '__main__':
 
     # Desactivar el aprendizaje y el forward del Kernel
     s1.cmd('sysctl net.ipv4.ip_forward=0')
-    s1.cmd('ip link set s1 down') # Matamos el bridge de Linux para que no interfiera
+    # s1.cmd('ip link set s1 down') # Matamos el bridge de Linux para que no interfiera
 
     # MODO SEGURO: Desactivar TODAS las optimizaciones que rompen XDP
     # Se lo hacemos a los hosts Y a las interfaces del switch
     interfaces = ['h1-eth0', 'h2-eth0', 's1-eth1', 's1-eth2']
     print("*** Blindando interfaces contra Kernel Panics...")
-    for intf in interfaces:
+    #for intf in interfaces:
         # Buscamos en qué nodo está la interfaz para mandarle el comando
-        node = h1 if 'h1' in intf else (h2 if 'h2' in intf else s1)
-        node.cmd('ethtool -K %s tx off rx off gso off gro off lro off' % intf)
-        node.cmd('ip link set %s promisc on' % intf)
+    #    node = h1 if 'h1' in intf else (h2 if 'h2' in intf else s1)
+    #    node.cmd('ethtool -K %s tx off rx off gso off gro off lro off' % intf)
+    #    node.cmd('ip link set %s promisc on' % intf)
     
     CLI(net) # Esto te deja una consola para que tú pruebes cosas
     net.stop()
