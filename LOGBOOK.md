@@ -238,3 +238,16 @@ sudo ip link set dummy1 up
 ping -I dummy0 8.8.8.8
 
 ```
+
+## Sesión [25-03-2026]
+### Ping-pong con la interfaz s1-eth1 del switch
+**Objetivo:** Lograr que, al hacer ping a la interfaz s1-eth1 desde uno de los hosts recibir un mensaje ICMP Echo Reply de vuelta.
+
+#### Comandos clave
+```bash
+# Comando para rellenar la tabla ARP del hosts con la MAC del switch
+mininet> h1 arp -s 10.0.0.100 7e:c7:e2:67:9c:69
+
+# Comando para asignarle una dirección IPv4 a la interfaz del switch que por defecto no tiene
+mininet> s1 ifconfig s1-eth1 10.0.0.100 up
+```

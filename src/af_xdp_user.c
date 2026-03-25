@@ -359,26 +359,54 @@ static bool process_packet(struct xsk_socket_info *xsk,
 		uint32_t tmp_ip;
 
 		// Aritmética de punteros básica
+
+		// DEBUG: Vamos a usar una forma más básica de calcular el tamaño de las cabeceras
+
+		// Verificamos tamaño:
+		if (len < sizeof(struct ethhdr) + sizeof(struct iphdr) + sizeof(struct icmphdr))
+			return false;
+
 		struct ethhdr *eth = (struct ethhdr *) pkt;
+
+		// Verificamos primero los protocolos
+		if (ntohs(eth->h_proto) != ETH_P_IP) 
+			return false;
+
+		printf("La cabecera Ethernet ocupa %ld bytes\n", sizeof(*eth));
 		// struct ipv6hdr *ipv6 = (struct ipv6hdr *) (eth + 1);
 		// Cambiamos por IPv4
-		struct iphdr *ipv4 = (struct iphdr *) (eth + 1);
-		struct icmphdr *icmp = (struct icmphdr *) (ipv4 + 1);
+		struct iphdr *ipv4 = (struct iphdr *) (pkt + sizeof(struct ethhdr));
+
+		if (ipv4->protocol != IPPROTO_ICMP) 
+			return false;
+
+		printf("La cabecera IPv4 ocupa %d bytes\n", ipv4->ihl * 4);
+		struct icmphdr *icmp = (struct icmphdr *) (pkt + sizeof(struct ethhdr) + ipv4->ihl * 4);
+
+
+		if (icmp->type != ICMP_ECHO)
+			return false;
+		printf("La cabecera ICMP ocupa %ld bytes\n", sizeof(*icmp));
+
 		// struct icmp6hdr *icmp = (struct icmp6hdr *) (ipv4 + 1);
 
 		// Comprobaciones básicas de seguridad. Verificamos que:
-		// El tamaño de la cabecera sea el mínimo para un mensaje ICMP
 		// La cabecera IPv4 especifique que el protocolo concreto que maneja es ICMP (para pings)
 		// Es un mensaje ECHO REQUEST
 		if (ntohs(eth->h_proto) != ETH_P_IP ||
-		    len < (sizeof(*eth) + sizeof(*ipv4) + sizeof(*icmp)) ||
 		    ipv4->protocol != IPPROTO_ICMP ||
 		    icmp->type != ICMP_ECHO)
 			return false;
 
+		printf("Efectivamente, es un paquete ICMP\n");
+
 		// Intercambio de direcciones MAC e IPv4, copias de memoria muy ligeras
 		// Guardamos el destino original (nosotros) en tmp_mac
-		memcpy(tmp_mac, eth->h_dest, ETH_ALEN);
+
+
+		// DEBUG: Quitamos todo esto
+		
+		/* memcpy(tmp_mac, eth->h_dest, ETH_ALEN);
 		// Copiamos el origen original en el nuevo destino (para devolverlo)
 		memcpy(eth->h_dest, eth->h_source, ETH_ALEN);
 		// Copiamos el destino original en el nuevo origen
@@ -389,12 +417,15 @@ static bool process_packet(struct xsk_socket_info *xsk,
 		memcpy(&ipv4->daddr, &tmp_ip, sizeof(tmp_ip));
 
 		// Cambiamos el tipo a un ECHO REPLY
-		icmp->type = ICMP_ECHOREPLY;
+		icmp->type = ICMP_ECHOREPLY; */
+		
 
-		// Recalculamos el checksum
-		csum_replace2(&icmp->checksum,
+		// DEBUG: De momento vamos a retirar el checksum
+		/* csum_replace2(&icmp->checksum,
 			      htons(ICMP_ECHO << 8),
-			      htons(ICMP_ECHOREPLY << 8));
+			      htons(ICMP_ECHOREPLY << 8)); */
+
+		// icmp->checksum = 0;
 
 		/* Here we sent the packet out of the receive port. Note that
 		 * we allocate one entry and schedule it. Your design would be
@@ -411,8 +442,12 @@ static bool process_packet(struct xsk_socket_info *xsk,
 		xsk_ring_prod__tx_desc(&xsk->tx, tx_idx)->addr = addr;
 		xsk_ring_prod__tx_desc(&xsk->tx, tx_idx)->len = len;
 		xsk_ring_prod__submit(&xsk->tx, 1);
+
+		printf("Se ha escrito correctamente en el TX Ring\n");
+
 		// Aumentamos en uno el número de paquetes que están "en proceso de envío"
-		xsk->outstanding_tx++;
+		xsk->outstanding_tx++; 
+		printf( "RESISTIRÉ, ERGUIDO FRENTE A TODO!!\n");
 		return true;
 	}
 
