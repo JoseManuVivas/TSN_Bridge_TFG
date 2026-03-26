@@ -143,6 +143,7 @@ static struct xsk_umem_info *configure_xsk_umem(void *buffer, uint64_t size)
 {	
 	// Estructura para almacenar información de la UMEM
 	struct xsk_umem_info *umem;
+
 	int ret;
 
 	// Reservamos la memoria para la estructura de la UMEM. calloc es más seguro que malloc porque inicializa a 0.
@@ -296,12 +297,9 @@ static void complete_tx(struct xsk_socket_info *xsk)
 	if (completed > 0) {
 		for (int i = 0; i < completed; i++) {
 		uint64_t addr = *xsk_ring_cons__comp_addr(&xsk->umem->cq, idx_cq++);
-            
-		// ELIMINAMOS EL OFFSET (para que vuelva a la pila como 0, 4096, 8192...)
-		// Esto se hace alineando a la baja al tamaño del frame (4096)
-		uint64_t frame_base = addr & ~(uint64_t)(FRAME_SIZE - 1);
+		addr = addr & ~(FRAME_SIZE - 1);
 		
-		xsk_free_umem_frame(xsk, frame_base);
+		xsk_free_umem_frame(xsk, addr);
 		}
 		
 		// Indicamos al Kernel las consumiciones que hemos hecho, por lo que ya puede usar esas posiciones para producir							  
@@ -336,6 +334,20 @@ static inline void csum_replace2(__sum16 *sum, __be16 old, __be16 new)
 	// Primero, invertimos el valor del checksum antiguo (el estándar de Internet exige que el checksum esté invertido) y le restamos los 16 bits del
 	// antiguo checksum. A continuación, le sumamos los 16 bits del nuevo checksum.
 	*sum = ~csum16_add(csum16_sub(~(*sum), old), new);
+}
+
+static uint16_t calc_checksum(uint16_t *buf, int len) {
+    uint32_t sum = 0;
+    while (len > 1) {
+        sum += *buf++;
+        len -= 2;
+    }
+    if (len == 1) {
+        sum += *(uint8_t *)buf;
+    }
+    sum = (sum >> 16) + (sum & 0xFFFF);
+    sum += (sum >> 16);
+    return (uint16_t)(~sum);
 }
 
 static bool process_packet(struct xsk_socket_info *xsk,
@@ -422,16 +434,17 @@ static bool process_packet(struct xsk_socket_info *xsk,
 		// No parece posible garantizar el Zero-Copy. Para ello, vamos a copiar el paquete original en un frame del que dispongamos
 		
 		// Extraemos un frame de la pila de libres
-		uint64_t frame_base = xsk_alloc_umem_frame(xsk);
-		if (frame_base == INVALID_UMEM_FRAME) {
+		uint64_t out_addr = xsk_alloc_umem_frame(xsk);
+		if (out_addr == INVALID_UMEM_FRAME) {
 			printf("No hay frames disponibles\n");
 			return false;
 		}
-
-		uint64_t out_addr = frame_base + XDP_PACKET_HEADROOM;
+		uint64_t offset_tx = XDP_PACKET_HEADROOM;
+		out_addr += offset_tx;
 		
 		// Obtenemos el puntero al nuevo frame
 		uint8_t *out_pkt = xsk_umem__get_data(xsk->umem->buffer,out_addr);
+
 
 		// Copiamos el paquete original al nuevo frame
 		memcpy(out_pkt, pkt, len);
@@ -452,11 +465,11 @@ static bool process_packet(struct xsk_socket_info *xsk,
 		out_icmp->type = ICMP_ECHOREPLY;
 
 		// Recalculamos Checksum de forma incremental (Ahora que es seguro escribir)
-		// csum_replace2(&out_icmp->checksum, htons(ICMP_ECHO << 8), htons(ICMP_ECHOREPLY << 8));
-		// DEBUG
-		out_icmp->checksum = 0;
+		out_icmp->checksum = 0; // Obligatorio ponerlo a 0 antes de calcular
 
-
+        // Calculamos la longitud real del payload ICMP
+        int icmp_len = len - sizeof(struct ethhdr) - (out_ipv4->ihl * 4);
+        out_icmp->checksum = calc_checksum((uint16_t *)out_icmp, icmp_len);
 
 		// DEBUG: De momento vamos a retirar el checksum
 		/* csum_replace2(&icmp->checksum,
@@ -473,7 +486,7 @@ static bool process_packet(struct xsk_socket_info *xsk,
 		ret = xsk_ring_prod__reserve(&xsk->tx, 1, &tx_idx);
 		if (ret != 1) {
 			/* No more transmit slots, drop the packet */
-			xsk_free_umem_frame(xsk, frame_base);
+			xsk_free_umem_frame(xsk, out_addr);
 			return false;
 		}
 
@@ -518,17 +531,14 @@ static void handle_receive_packets(struct xsk_socket_info *xsk)
 					     &idx_fq);
 
 		// Esto en caso de que, por algún motivo extraño fallara xsk_prod_nb_free
-		while (ret != stock_frames)
-			ret = xsk_ring_prod__reserve(&xsk->umem->fq, rcvd,
-						     &idx_fq);
-		
-		// Ahora rellenamos la FQ con los frames disponibles gestionados por el socket
-		for (i = 0; i < stock_frames; i++)
-			*xsk_ring_prod__fill_addr(&xsk->umem->fq, idx_fq++) =
-				xsk_alloc_umem_frame(xsk);
+		if (ret > 0) {
+            // Rellenamos solo la cantidad que realmente pudimos reservar
+            for (i = 0; i < ret; i++)
+                *xsk_ring_prod__fill_addr(&xsk->umem->fq, idx_fq++) = xsk_alloc_umem_frame(xsk);
 
-		// Avanzamos el puntero del productor del Kernel
-		xsk_ring_prod__submit(&xsk->umem->fq, stock_frames);
+            xsk_ring_prod__submit(&xsk->umem->fq, ret);
+        }
+	
 	}
 
 	// Recorremos el RX ring y sus descriptores
@@ -538,16 +548,19 @@ static void handle_receive_packets(struct xsk_socket_info *xsk)
 		uint32_t len = xsk_ring_cons__rx_desc(&xsk->rx, idx_rx++)->len;
 
 		// Si el paquete no se ha podido procesar por algún motivo, simplemente liberamos el frame, DROP del paquete
-		if (!process_packet(xsk, addr, len))
+		if (!process_packet(xsk, addr, len)) {
 			xsk_free_umem_frame(xsk, addr);
+			printf("PRIMER PAQUETE LIBERADO\n");
+		}
 
 	}
 
 	// Avanzamos el puntero de consumidor del Kernel, sirve para indicarle que ya hemos leído los frames del RX ring y el Kernel ya puede usarlos
 	xsk_ring_cons__release(&xsk->rx, rcvd);
 
-	/* Do we need to wake up the kernel for transmission */
+	printf("Transmisión completada!!\n");
 	complete_tx(xsk);
+	printf("Ring TX liberado\n");
   }
 
   // Función principal para detectar paquetes recibidos en el RX ring del socket y 
