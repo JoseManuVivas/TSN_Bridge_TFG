@@ -294,11 +294,15 @@ static void complete_tx(struct xsk_socket_info *xsk)
 	
 	// En caso de que haya frames en la CQ sabemos que ya han terminado de ser transmitidos, por lo que podemos meterlos en la pila de frames libres
 	if (completed > 0) {
-		for (int i = 0; i < completed; i++)
-			// Obtenemos el frame correspondiente y vamos avanzando el índice indicando que vamos consumiendo
-			xsk_free_umem_frame(xsk,
-					    *xsk_ring_cons__comp_addr(&xsk->umem->cq,
-								      idx_cq++));
+		for (int i = 0; i < completed; i++) {
+		uint64_t addr = *xsk_ring_cons__comp_addr(&xsk->umem->cq, idx_cq++);
+            
+		// ELIMINAMOS EL OFFSET (para que vuelva a la pila como 0, 4096, 8192...)
+		// Esto se hace alineando a la baja al tamaño del frame (4096)
+		uint64_t frame_base = addr & ~(uint64_t)(FRAME_SIZE - 1);
+		
+		xsk_free_umem_frame(xsk, frame_base);
+		}
 		
 		// Indicamos al Kernel las consumiciones que hemos hecho, por lo que ya puede usar esas posiciones para producir							  
 		xsk_ring_cons__release(&xsk->umem->cq, completed);
@@ -393,10 +397,6 @@ static bool process_packet(struct xsk_socket_info *xsk,
 		// Comprobaciones básicas de seguridad. Verificamos que:
 		// La cabecera IPv4 especifique que el protocolo concreto que maneja es ICMP (para pings)
 		// Es un mensaje ECHO REQUEST
-		if (ntohs(eth->h_proto) != ETH_P_IP ||
-		    ipv4->protocol != IPPROTO_ICMP ||
-		    icmp->type != ICMP_ECHO)
-			return false;
 
 		printf("Efectivamente, es un paquete ICMP\n");
 
@@ -418,7 +418,45 @@ static bool process_packet(struct xsk_socket_info *xsk,
 
 		// Cambiamos el tipo a un ECHO REPLY
 		icmp->type = ICMP_ECHOREPLY; */
+
+		// No parece posible garantizar el Zero-Copy. Para ello, vamos a copiar el paquete original en un frame del que dispongamos
 		
+		// Extraemos un frame de la pila de libres
+		uint64_t frame_base = xsk_alloc_umem_frame(xsk);
+		if (frame_base == INVALID_UMEM_FRAME) {
+			printf("No hay frames disponibles\n");
+			return false;
+		}
+
+		uint64_t out_addr = frame_base + XDP_PACKET_HEADROOM;
+		
+		// Obtenemos el puntero al nuevo frame
+		uint8_t *out_pkt = xsk_umem__get_data(xsk->umem->buffer,out_addr);
+
+		// Copiamos el paquete original al nuevo frame
+		memcpy(out_pkt, pkt, len);
+		struct ethhdr  *out_eth  = (struct ethhdr *) out_pkt;
+    	struct iphdr   *out_ipv4 = (struct iphdr *) (out_pkt + sizeof(struct ethhdr));
+    	struct icmphdr *out_icmp = (struct icmphdr *) (out_pkt + sizeof(struct ethhdr) + (out_ipv4->ihl * 4));
+
+		memcpy(tmp_mac, out_eth->h_dest, ETH_ALEN);
+		memcpy(out_eth->h_dest, out_eth->h_source, ETH_ALEN);
+		memcpy(out_eth->h_source, tmp_mac, ETH_ALEN);
+
+		// IP Swap
+		tmp_ip = out_ipv4->saddr;
+		out_ipv4->saddr = out_ipv4->daddr;
+		out_ipv4->daddr = tmp_ip;
+
+		// ICMP Tipo Reply
+		out_icmp->type = ICMP_ECHOREPLY;
+
+		// Recalculamos Checksum de forma incremental (Ahora que es seguro escribir)
+		// csum_replace2(&out_icmp->checksum, htons(ICMP_ECHO << 8), htons(ICMP_ECHOREPLY << 8));
+		// DEBUG
+		out_icmp->checksum = 0;
+
+
 
 		// DEBUG: De momento vamos a retirar el checksum
 		/* csum_replace2(&icmp->checksum,
@@ -435,11 +473,12 @@ static bool process_packet(struct xsk_socket_info *xsk,
 		ret = xsk_ring_prod__reserve(&xsk->tx, 1, &tx_idx);
 		if (ret != 1) {
 			/* No more transmit slots, drop the packet */
+			xsk_free_umem_frame(xsk, frame_base);
 			return false;
 		}
 
 		// Ahora sí, con Zero-copy dejamos la dirección del nuevo paquete y su longitud
-		xsk_ring_prod__tx_desc(&xsk->tx, tx_idx)->addr = addr;
+		xsk_ring_prod__tx_desc(&xsk->tx, tx_idx)->addr = out_addr;
 		xsk_ring_prod__tx_desc(&xsk->tx, tx_idx)->len = len;
 		xsk_ring_prod__submit(&xsk->tx, 1);
 
@@ -448,7 +487,7 @@ static bool process_packet(struct xsk_socket_info *xsk,
 		// Aumentamos en uno el número de paquetes que están "en proceso de envío"
 		xsk->outstanding_tx++; 
 		printf( "RESISTIRÉ, ERGUIDO FRENTE A TODO!!\n");
-		return true;
+		return false;
 	}
 
 	return false;
