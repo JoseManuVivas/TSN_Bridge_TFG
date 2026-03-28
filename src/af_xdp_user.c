@@ -296,9 +296,9 @@ static void complete_tx(struct xsk_socket_info *xsk)
 	// En caso de que haya frames en la CQ sabemos que ya han terminado de ser transmitidos, por lo que podemos meterlos en la pila de frames libres
 	if (completed > 0) {
 		for (int i = 0; i < completed; i++) {
-		uint64_t addr = *xsk_ring_cons__comp_addr(&xsk->umem->cq, idx_cq++);
+		uint64_t addr = *xsk_ring_cons__comp_addr(&xsk->umem->cq, idx_cq++);	
 		addr = addr & ~(FRAME_SIZE - 1);
-		
+		// Liberamos el frame
 		xsk_free_umem_frame(xsk, addr);
 		}
 		
@@ -308,32 +308,6 @@ static void complete_tx(struct xsk_socket_info *xsk)
 		xsk->outstanding_tx -= completed < xsk->outstanding_tx ?
 			completed : xsk->outstanding_tx;
 	}
-}
-
-// Función que realiza la suma con acarreo
-static inline __sum16 csum16_add(__sum16 csum, __be16 addend)
-{
-	uint16_t res = (uint16_t)csum;
-
-	// Suma a pelo.
-	res += (__u16)addend;
-
-	// Si hemos desborado el límite de 16 bits (el resultado es menor que uno de los operandos, sumamos ese bit de acarreo)
-	return (__sum16)(res + (res < (__u16)addend));
-}
-
-// Función que resta a csum addend
-static inline __sum16 csum16_sub(__sum16 csum, __be16 addend)
-{
-	return csum16_add(csum, ~addend);
-}
-
-// Función para reemplazar en el valor del checksum 16 bits antiguos por 16 bits nuevos de forma rápida
-static inline void csum_replace2(__sum16 *sum, __be16 old, __be16 new)
-{
-	// Primero, invertimos el valor del checksum antiguo (el estándar de Internet exige que el checksum esté invertido) y le restamos los 16 bits del
-	// antiguo checksum. A continuación, le sumamos los 16 bits del nuevo checksum.
-	*sum = ~csum16_add(csum16_sub(~(*sum), old), new);
 }
 
 static uint16_t calc_checksum(uint16_t *buf, int len) {
@@ -397,6 +371,7 @@ static bool process_packet(struct xsk_socket_info *xsk,
 			return false;
 
 		printf("La cabecera IPv4 ocupa %d bytes\n", ipv4->ihl * 4);
+
 		struct icmphdr *icmp = (struct icmphdr *) (pkt + sizeof(struct ethhdr) + ipv4->ihl * 4);
 
 
@@ -414,11 +389,11 @@ static bool process_packet(struct xsk_socket_info *xsk,
 
 		// Intercambio de direcciones MAC e IPv4, copias de memoria muy ligeras
 		// Guardamos el destino original (nosotros) en tmp_mac
-
+		fflush(stdout);
 
 		// DEBUG: Quitamos todo esto
 		
-		/* memcpy(tmp_mac, eth->h_dest, ETH_ALEN);
+		memcpy(tmp_mac, eth->h_dest, ETH_ALEN);
 		// Copiamos el origen original en el nuevo destino (para devolverlo)
 		memcpy(eth->h_dest, eth->h_source, ETH_ALEN);
 		// Copiamos el destino original en el nuevo origen
@@ -429,47 +404,14 @@ static bool process_packet(struct xsk_socket_info *xsk,
 		memcpy(&ipv4->daddr, &tmp_ip, sizeof(tmp_ip));
 
 		// Cambiamos el tipo a un ECHO REPLY
-		icmp->type = ICMP_ECHOREPLY; */
+		icmp->type = ICMP_ECHOREPLY; 
+
+		icmp->checksum = 0;
+		int icmp_len = len - sizeof(struct ethhdr) - (ipv4->ihl * 4);
+		icmp->checksum = calc_checksum((uint16_t *)icmp, icmp_len);
 
 		// No parece posible garantizar el Zero-Copy. Para ello, vamos a copiar el paquete original en un frame del que dispongamos
 		
-		// Extraemos un frame de la pila de libres
-		uint64_t out_addr = xsk_alloc_umem_frame(xsk);
-		if (out_addr == INVALID_UMEM_FRAME) {
-			printf("No hay frames disponibles\n");
-			return false;
-		}
-		uint64_t offset_tx = XDP_PACKET_HEADROOM;
-		out_addr += offset_tx;
-		
-		// Obtenemos el puntero al nuevo frame
-		uint8_t *out_pkt = xsk_umem__get_data(xsk->umem->buffer,out_addr);
-
-
-		// Copiamos el paquete original al nuevo frame
-		memcpy(out_pkt, pkt, len);
-		struct ethhdr  *out_eth  = (struct ethhdr *) out_pkt;
-    	struct iphdr   *out_ipv4 = (struct iphdr *) (out_pkt + sizeof(struct ethhdr));
-    	struct icmphdr *out_icmp = (struct icmphdr *) (out_pkt + sizeof(struct ethhdr) + (out_ipv4->ihl * 4));
-
-		memcpy(tmp_mac, out_eth->h_dest, ETH_ALEN);
-		memcpy(out_eth->h_dest, out_eth->h_source, ETH_ALEN);
-		memcpy(out_eth->h_source, tmp_mac, ETH_ALEN);
-
-		// IP Swap
-		tmp_ip = out_ipv4->saddr;
-		out_ipv4->saddr = out_ipv4->daddr;
-		out_ipv4->daddr = tmp_ip;
-
-		// ICMP Tipo Reply
-		out_icmp->type = ICMP_ECHOREPLY;
-
-		// Recalculamos Checksum de forma incremental (Ahora que es seguro escribir)
-		out_icmp->checksum = 0; // Obligatorio ponerlo a 0 antes de calcular
-
-        // Calculamos la longitud real del payload ICMP
-        int icmp_len = len - sizeof(struct ethhdr) - (out_ipv4->ihl * 4);
-        out_icmp->checksum = calc_checksum((uint16_t *)out_icmp, icmp_len);
 
 		// DEBUG: De momento vamos a retirar el checksum
 		/* csum_replace2(&icmp->checksum,
@@ -485,22 +427,21 @@ static bool process_packet(struct xsk_socket_info *xsk,
 		// Reservamos espacio para un paquete en el TX ring del socket
 		ret = xsk_ring_prod__reserve(&xsk->tx, 1, &tx_idx);
 		if (ret != 1) {
-			/* No more transmit slots, drop the packet */
-			xsk_free_umem_frame(xsk, out_addr);
 			return false;
 		}
 
 		// Ahora sí, con Zero-copy dejamos la dirección del nuevo paquete y su longitud
-		xsk_ring_prod__tx_desc(&xsk->tx, tx_idx)->addr = out_addr;
+		xsk_ring_prod__tx_desc(&xsk->tx, tx_idx)->addr = addr;
 		xsk_ring_prod__tx_desc(&xsk->tx, tx_idx)->len = len;
 		xsk_ring_prod__submit(&xsk->tx, 1);
 
 		printf("Se ha escrito correctamente en el TX Ring\n");
+		fflush(stdout);
 
 		// Aumentamos en uno el número de paquetes que están "en proceso de envío"
 		xsk->outstanding_tx++; 
 		printf( "RESISTIRÉ, ERGUIDO FRENTE A TODO!!\n");
-		return false;
+		return true;
 	}
 
 	return false;
@@ -549,6 +490,7 @@ static void handle_receive_packets(struct xsk_socket_info *xsk)
 
 		// Si el paquete no se ha podido procesar por algún motivo, simplemente liberamos el frame, DROP del paquete
 		if (!process_packet(xsk, addr, len)) {
+			addr = addr & ~(FRAME_SIZE - 1);
 			xsk_free_umem_frame(xsk, addr);
 			printf("PRIMER PAQUETE LIBERADO\n");
 		}
@@ -559,6 +501,7 @@ static void handle_receive_packets(struct xsk_socket_info *xsk)
 	xsk_ring_cons__release(&xsk->rx, rcvd);
 
 	printf("Transmisión completada!!\n");
+	fflush(stdout);
 	complete_tx(xsk);
 	printf("Ring TX liberado\n");
   }
