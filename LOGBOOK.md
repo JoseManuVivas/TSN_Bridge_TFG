@@ -260,3 +260,5 @@ mininet> s1 ifconfig s1-eth1 10.0.0.100 up
 - Dado que `global_exit` es escrita por la señal y leída por los dos threads es necesario que nada más actualizarse la variable los threads la vean. Por tanto, hay que hacerla volátil y evitar optimizaciones
 
 - Las funciones de `xsk_alloc_umem_frame` y de `xsk_free_umem_frame` escriben y leen en en una UMEM común paralelamente en cada frame. La UMEM es la única estructura común a los dos sockets, por lo tanto, estas dos funciones deben protegerse con un mutex.
+
+- El bridge no va tan rápido como podría. Evidentemente las limitaciones de Mininet están ahí, pero una opción para mejorar la contención en TCP sería, en lugar de tener un pool compartido de frames para cada socket y tener que usar un mutex que crea mucha contención sería tener un número determinado de frames reservado para cada socket
