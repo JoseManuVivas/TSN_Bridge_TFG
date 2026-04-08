@@ -45,7 +45,7 @@ if __name__ == '__main__':
 
     # Desactivar el aprendizaje y el forward del Kernel
     s1.cmd('sysctl net.ipv4.ip_forward=0')
-    s1.cmd('ip link set s1 down') # Matamos el bridge de Linux para que no interfiera
+    # s1.cmd('ip link set s1 down') # Matamos el bridge de Linux para que no interfiera
 
     # MODO SEGURO: Desactivar TODAS las optimizaciones que rompen XDP
     # Se lo hacemos a los hosts Y a las interfaces del switch

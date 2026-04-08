@@ -11,6 +11,8 @@
 #include <string.h>
 #include <time.h>
 #include <unistd.h>
+#include <pthread.h>
+#include <stdatomic.h>
 
 #include <sys/resource.h>
 
@@ -50,7 +52,7 @@ struct config cfgs[MAX_SOCKS] = {
         .attach_mode = XDP_MODE_SKB,
         .xdp_flags = XDP_FLAGS_SKB_MODE,
         .xsk_bind_flags = XDP_COPY,
-		.xsk_poll_mode = true
+		.xsk_poll_mode = false
     },
     [1] = {
         .ifname = "s1-eth2",
@@ -59,7 +61,7 @@ struct config cfgs[MAX_SOCKS] = {
         .attach_mode = XDP_MODE_SKB,
         .xdp_flags = XDP_FLAGS_SKB_MODE,
         .xsk_bind_flags = XDP_COPY,
-		.xsk_poll_mode = true
+		.xsk_poll_mode = false
     }
 };
 
@@ -79,6 +81,8 @@ struct xsk_umem_info {
 	uint64_t umem_frame_addr[NUM_FRAMES];
 	uint32_t umem_frame_free;
 
+	pthread_mutex_t frame_lock; // mutex para proteger el acceso a la pila de frames libres
+
 	// Dirección de inicio de la UMEM
 	void *buffer;
 };
@@ -94,6 +98,13 @@ struct xsk_socket_info {
 
 	uint32_t outstanding_tx;
 
+};
+
+// Estructura para pasar argumentos a cada hilo que hará polling en un socket
+struct thread_args {
+    struct config *cfg;
+    struct xsk_socket_info *xsk_in;
+    struct xsk_socket_info *xsk_out;
 };
 
 static const char *__doc__ __attribute__((unused)) = "AF_XDP kernel bypass example\n";
@@ -142,7 +153,8 @@ static const struct option_wrapper __attribute__((unused))long_options[] = {
 	{{0, 0, NULL,  0 }, NULL, false}
 };
 
-static bool global_exit;
+// atómica para que sea visible entre cores
+static atomic_bool global_exit;
 
 // Función para configurar la UMEM
 static struct xsk_umem_info *configure_xsk_umem(void *buffer, uint64_t size)
@@ -177,23 +189,33 @@ static struct xsk_umem_info *configure_xsk_umem(void *buffer, uint64_t size)
 	// Inicialmente todos los frames están disponibles
 	umem->umem_frame_free = NUM_FRAMES;
 
+	// Inicializamos el mutex
+	pthread_mutex_init(&umem->frame_lock, NULL);
+
 	return umem;
 }
 
 // Función para pasar offsets de frames desde la pila de la UMEM a la Fill Queue del socket
 static uint64_t xsk_alloc_umem_frame(struct xsk_socket_info *xsk)
 {
+	// Bloqueamos el mutex
+	pthread_mutex_lock(&xsk->umem->frame_lock);
 	// variable que representa el offset
 	uint64_t frame;
 	// Si no hay frames disponibles, devolvemos un valor inválido
-	if (xsk->umem->umem_frame_free == 0)
+	if (xsk->umem->umem_frame_free == 0) {
+		pthread_mutex_unlock(&xsk->umem->frame_lock);
 		return INVALID_UMEM_FRAME;
+	}
 
 	// Pre-decremento. Muy eficiente, porque al mismom tiempo disminuyemos en 1 el número de frames libres y obtenemos el índice del siguiente frame libre 
 	// porque en el vector se indexa desde 0.
 	frame = xsk->umem->umem_frame_addr[--xsk->umem->umem_frame_free];
 	// Apuntamos un valor inválido para evitar que se vuelva a usar el mismo frame sin liberarlo.
 	xsk->umem->umem_frame_addr[xsk->umem->umem_frame_free] = INVALID_UMEM_FRAME;
+	// Desbloqueamos el mutex
+	pthread_mutex_unlock(&xsk->umem->frame_lock);
+
 	return frame;
 }
 
@@ -201,17 +223,29 @@ static uint64_t xsk_alloc_umem_frame(struct xsk_socket_info *xsk)
 // Se usa esta estructura para aprovecharse de la propiedad de localidad temporal.
 static void xsk_free_umem_frame(struct xsk_socket_info *xsk, uint64_t frame)
 {
+	// Bloqueamos el mutex
+	pthread_mutex_lock(&xsk->umem->frame_lock);
 	// Si no está llena la pila de frames libres (no debería)
 	assert(xsk->umem->umem_frame_free < NUM_FRAMES);
 
 	// Guarda el frame en la cima de la pila
 	xsk->umem->umem_frame_addr[xsk->umem->umem_frame_free++] = frame;
+	// Desbloqueamos el mutex
+	pthread_mutex_unlock(&xsk->umem->frame_lock);
 }
+
 
 // Función para obtener el número de frames disponibles
 static uint64_t xsk_umem_free_frames(struct xsk_umem_info *umem)
 {
-	return umem->umem_frame_free;
+	// Bloqueamos el mutex
+	pthread_mutex_lock(&umem->frame_lock);
+	// Devolvemos el número de frames disponibles
+	uint64_t ret = umem->umem_frame_free;
+	// Desbloqueamos el mutex
+	pthread_mutex_unlock(&umem->frame_lock);
+	// Devolvemos el número de frames disponibles
+	return ret;
 }
 
 // Función para configurar el socket AF_XDP
@@ -534,8 +568,27 @@ static void handle_receive_packets(struct xsk_socket_info *xsk_in, struct xsk_so
 	printf("Ring TX liberado\n");
   }
 
+// Función que se ejecutará en cada hilo, que hace polling de un socket concreto
+static void *rx_thread(void *arg)
+{
+    struct thread_args *targs = (struct thread_args *)arg;
+    struct pollfd fds = {
+        .fd     = xsk_socket__fd(targs->xsk_in->xsk),
+        .events = POLLIN
+    };
+
+    while (!global_exit) {
+        int timeout = targs->cfg->xsk_poll_mode ? -1 : 0;
+        poll(&fds, 1, timeout);
+
+        if (fds.revents & POLLIN)
+            handle_receive_packets(targs->xsk_in, targs->xsk_out);
+    }
+    return NULL;
+}
+
   // Función principal para detectar paquetes recibidos en el RX ring del socket y 
-static void rx_and_process(struct config cfgs[],
+/* static void rx_and_process(struct config cfgs[],
 			   struct xsk_socket_info *xsk_socket[])
 {	
 	// Estructura estándar de Linux para monitorizar descriptores de archivos.
@@ -568,7 +621,7 @@ static void rx_and_process(struct config cfgs[],
 			}
     	}
 	}
-}
+} */
 
 /* #define NANOSEC_PER_SEC 1000000000 10^9 
 static uint64_t gettime(void)
@@ -743,14 +796,32 @@ int main(int argc, char **argv)
 		}
 	}
 
-	// Función principal de recepción y procesamiento de paquetes.
-	rx_and_process(cfgs, xsk_socket);
+	/* // Función principal de recepción y procesamiento de paquetes.
+	rx_and_process(cfgs, xsk_socket); */
+
+	// Creamos cada thread
+	pthread_t threads[MAX_SOCKS];
+	struct thread_args targs[MAX_SOCKS];
+
+	// Definimos los argumentos de cada thread
+	for (int i = 0; i < MAX_SOCKS; i++) {
+		targs[i].cfg     = &cfgs[i];
+		targs[i].xsk_in  = xsk_socket[i];
+		targs[i].xsk_out = xsk_socket[i ^ 1];
+		pthread_create(&threads[i], NULL, rx_thread, &targs[i]);
+	}
+
+	// Esperamos a que ambos threads terminen (cuando global_exit = true)
+	for (int i = 0; i < MAX_SOCKS; i++)
+		pthread_join(threads[i], NULL);
 
 	// Limpiamos los sockets
 	for (int i = 0; i < MAX_SOCKS; i++) {
 		xsk_socket__delete(xsk_socket[i]->xsk);
 		free(xsk_socket[i]);
 	}
+	// Destruimos el mutex
+	pthread_mutex_destroy(&umem->frame_lock);
 	xsk_umem__delete(umem->umem);
 	free(umem);
 	free(packet_buffer);

@@ -251,3 +251,12 @@ mininet> h1 arp -s 10.0.0.100 7e:c7:e2:67:9c:69
 # Comando para asignarle una dirección IPv4 a la interfaz del switch que por defecto no tiene
 mininet> s1 ifconfig s1-eth1 10.0.0.100 up
 ```
+
+## Sesion [8-03-2026]
+### Bridge ya funcionando, buscando paralelismo usando la biblioteca `<pthread>`
+**Objetivo:** Conseguir que el polling de cada socket se haga en un thread de forma "paralela", para mejorar la latencia
+
+#### Notas técnicas
+- Dado que `global_exit` es escrita por la señal y leída por los dos threads es necesario que nada más actualizarse la variable los threads la vean. Por tanto, hay que hacerla volátil y evitar optimizaciones
+
+- Las funciones de `xsk_alloc_umem_frame` y de `xsk_free_umem_frame` escriben y leen en en una UMEM común paralelamente en cada frame. La UMEM es la única estructura común a los dos sockets, por lo tanto, estas dos funciones deben protegerse con un mutex.
