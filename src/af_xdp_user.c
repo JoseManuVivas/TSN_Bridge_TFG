@@ -49,7 +49,8 @@ struct config cfgs[MAX_SOCKS] = {
         .progname = "xdp_sock_prog",
         .attach_mode = XDP_MODE_SKB,
         .xdp_flags = XDP_FLAGS_SKB_MODE,
-        .xsk_bind_flags = XDP_COPY
+        .xsk_bind_flags = XDP_COPY,
+		.xsk_poll_mode = true
     },
     [1] = {
         .ifname = "s1-eth2",
@@ -57,7 +58,8 @@ struct config cfgs[MAX_SOCKS] = {
         .progname = "xdp_sock_prog",
         .attach_mode = XDP_MODE_SKB,
         .xdp_flags = XDP_FLAGS_SKB_MODE,
-        .xsk_bind_flags = XDP_COPY
+        .xsk_bind_flags = XDP_COPY,
+		.xsk_poll_mode = true
     }
 };
 
