@@ -406,107 +406,120 @@ static bool process_packet(struct xsk_socket_info *xsk_in, struct xsk_socket_inf
 	printf("Recibido paquete de longitud %u\n", len);
 
 	// Bridge simple entre dos interfaces
-	if (true) {
-		int ret;
-		uint32_t tx_idx = 0;
+	int ret;
+	uint32_t tx_idx = 0;
 
-		// Aritmética de punteros básica
+	// Aritmética de punteros básica
 
-		// DEBUG: Vamos a usar una forma más básica de calcular el tamaño de las cabeceras
+	// DEBUG: Vamos a usar una forma más básica de calcular el tamaño de las cabeceras
 
-		// Verificamos tamaño:
-		if (len < sizeof(struct ethhdr))
+	// Verificamos tamaño:
+	if (len < sizeof(struct ethhdr))
+		return false;
+
+	struct ethhdr *eth = (struct ethhdr *) pkt;
+
+	uint16_t proto = ntohs(eth->h_proto);
+
+	// Verificamos primero los protocolos. Permitimos tambien ARP para aprendizaje
+	if (proto != ETH_P_IP && proto != ETH_P_ARP)
+		return false;
+
+	printf("La cabecera Ethernet ocupa %ld bytes\n", sizeof(*eth));
+	// struct ipv6hdr *ipv6 = (struct ipv6hdr *) (eth + 1);
+	if (proto == ETH_P_ARP) {
+		// Para hacer menos verificaciones
+		goto forward;
+	} else {
+
+		// Verificamos que el tamaño de la cabecera IPv4 sea correcto
+		if (len < sizeof(struct ethhdr) + sizeof(struct iphdr))
 			return false;
 
-		struct ethhdr *eth = (struct ethhdr *) pkt;
+		// Cambiamos por IPv4
+		struct iphdr *ipv4 = (struct iphdr *) (pkt + sizeof(struct ethhdr));
 
-		uint16_t proto = ntohs(eth->h_proto);
-
-		// Verificamos primero los protocolos. Permitimos tambien ARP para aprendizaje
-		if (proto != ETH_P_IP && proto != ETH_P_ARP)
+		if (ipv4->ihl < 5 || ipv4->ihl > 15) {
+			printf("Tamaño de cabecera IPv4 no válido\n");
 			return false;
+		}
 
-		printf("La cabecera Ethernet ocupa %ld bytes\n", sizeof(*eth));
-		// struct ipv6hdr *ipv6 = (struct ipv6hdr *) (eth + 1);
+		/* if (ipv4->protocol != IPPROTO_ICMP) {
+			printf("Es un paquete IPv4 pero no es ICMP\n");
+			return false;
+		} */
 
-		if (proto == ETH_P_IP) {
-			// Cambiamos por IPv4
-			struct iphdr *ipv4 = (struct iphdr *) (pkt + sizeof(struct ethhdr));
+		printf("La cabecera IPv4 ocupa %d bytes\n", ipv4->ihl * 4);
 
-			if (ipv4->protocol != IPPROTO_ICMP) {
-				printf("Es un paquete IPv4 pero no es ICMP\n");
+
+		if (ipv4->protocol == IPPROTO_ICMP) {
+
+			if (len < sizeof(struct ethhdr) + (uint32_t)ipv4->ihl * 4 + sizeof(struct icmphdr))
 				return false;
-			}
-
-			printf("La cabecera IPv4 ocupa %d bytes\n", ipv4->ihl * 4);
 
 			struct icmphdr *icmp = (struct icmphdr *) (pkt + sizeof(struct ethhdr) + ipv4->ihl * 4);
-
-
 			if (icmp->type != ICMP_ECHO && icmp->type != ICMP_ECHOREPLY) {
 				printf("Es un paquete ICMP pero no es pregunta o respuesta\n");
+				printf("La cabecera ICMP ocupa %ld bytes\n", sizeof(*icmp));
 				return false;
 			}
-
-			printf("La cabecera ICMP ocupa %ld bytes\n", sizeof(*icmp));
-
-			// struct icmp6hdr *icmp = (struct icmp6hdr *) (ipv4 + 1);
-
-			// Comprobaciones básicas de seguridad. Verificamos que:
-			// La cabecera IPv4 especifique que el protocolo concreto que maneja es ICMP (para pings)
-			// Es un mensaje ECHO REQUEST
-
 		}
+
+		// struct icmp6hdr *icmp = (struct icmp6hdr *) (ipv4 + 1);
+
+		// Comprobaciones básicas de seguridad. Verificamos que:
+		// La cabecera IPv4 especifique que el protocolo concreto que maneja es ICMP (para pings)
+		// Es un mensaje ECHO REQUEST
 
 		// Guardamos el destino original (nosotros) en tmp_mac
 		fflush(stdout);
-
-		// DEBUG: Quitamos todo esto
-		
-		// Eliminamos el código que intercambia cabeceras
-		/* memcpy(tmp_mac, eth->h_dest, ETH_ALEN);
-		// Copiamos el origen original en el nuevo destino (para devolverlo)
-		memcpy(eth->h_dest, eth->h_source, ETH_ALEN);
-		// Copiamos el destino original en el nuevo origen
-		memcpy(eth->h_source, tmp_mac, ETH_ALEN);
-
-		memcpy(&tmp_ip, &ipv4->saddr, sizeof(tmp_ip));
-		memcpy(&ipv4->saddr, &ipv4->daddr, sizeof(tmp_ip));
-		memcpy(&ipv4->daddr, &tmp_ip, sizeof(tmp_ip)); */
-		
-
-		// DEBUG: De momento vamos a retirar el checksum
-		/* csum_replace2(&icmp->checksum,
-			      htons(ICMP_ECHO << 8),
-			      htons(ICMP_ECHOREPLY << 8)); */
-
-		// icmp->checksum = 0;
-
-		/* Here we sent the packet out of the receive port. Note that
-		 * we allocate one entry and schedule it. Your design would be
-		 * faster if you do batch processing/transmission */
-
-		// Reservamos espacio para un paquete en el TX ring del socket de salida
-		ret = xsk_ring_prod__reserve(&xsk_out->tx, 1, &tx_idx);
-		if (ret != 1) {
-			return false;
-		}
-
-		// Ahora sí, con Zero-copy dejamos la dirección del nuevo paquete y su longitud
-		xsk_ring_prod__tx_desc(&xsk_out->tx, tx_idx)->addr = addr;
-		xsk_ring_prod__tx_desc(&xsk_out->tx, tx_idx)->len = len;
-		xsk_ring_prod__submit(&xsk_out->tx, 1);
-
-		printf("Se ha escrito correctamente en el TX Ring\n");
-		fflush(stdout);
-
-		// Aumentamos en uno el número de paquetes que están "en proceso de envío"
-		xsk_out->outstanding_tx++; 
-		printf( "RESISTIRÉ, ERGUIDO FRENTE A TODO!!\n");
-		return true;
 	}
 
-	return false;
+	// DEBUG: Quitamos todo esto
+	
+	// Eliminamos el código que intercambia cabeceras
+	/* memcpy(tmp_mac, eth->h_dest, ETH_ALEN);
+	// Copiamos el origen original en el nuevo destino (para devolverlo)
+	memcpy(eth->h_dest, eth->h_source, ETH_ALEN);
+	// Copiamos el destino original en el nuevo origen
+	memcpy(eth->h_source, tmp_mac, ETH_ALEN);
+
+	memcpy(&tmp_ip, &ipv4->saddr, sizeof(tmp_ip));
+	memcpy(&ipv4->saddr, &ipv4->daddr, sizeof(tmp_ip));
+	memcpy(&ipv4->daddr, &tmp_ip, sizeof(tmp_ip)); */
+	
+
+	// DEBUG: De momento vamos a retirar el checksum
+	/* csum_replace2(&icmp->checksum,
+				htons(ICMP_ECHO << 8),
+				htons(ICMP_ECHOREPLY << 8)); */
+
+	// icmp->checksum = 0;
+
+	/* Here we sent the packet out of the receive port. Note that
+		* we allocate one entry and schedule it. Your design would be
+		* faster if you do batch processing/transmission */
+		
+forward: 
+	// Reservamos espacio para un paquete en el TX ring del socket de salida
+	ret = xsk_ring_prod__reserve(&xsk_out->tx, 1, &tx_idx);
+	if (ret != 1) {
+		return false;
+	}
+
+	// Ahora sí, con Zero-copy dejamos la dirección del nuevo paquete y su longitud
+	xsk_ring_prod__tx_desc(&xsk_out->tx, tx_idx)->addr = addr;
+	xsk_ring_prod__tx_desc(&xsk_out->tx, tx_idx)->len = len;
+	xsk_ring_prod__submit(&xsk_out->tx, 1);
+
+	printf("Se ha escrito correctamente en el TX Ring\n");
+	fflush(stdout);
+
+	// Aumentamos en uno el número de paquetes que están "en proceso de envío"
+	xsk_out->outstanding_tx++; 
+	printf( "RESISTIRÉ, ERGUIDO FRENTE A TODO!!\n");
+	return true;
+
 }
 
 static void handle_receive_packets(struct xsk_socket_info *xsk_in, struct xsk_socket_info *xsk_out)
