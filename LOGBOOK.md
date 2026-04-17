@@ -261,4 +261,21 @@ mininet> s1 ifconfig s1-eth1 10.0.0.100 up
 
 - Las funciones de `xsk_alloc_umem_frame` y de `xsk_free_umem_frame` escriben y leen en en una UMEM común paralelamente en cada frame. La UMEM es la única estructura común a los dos sockets, por lo tanto, estas dos funciones deben protegerse con un mutex.
 
-- El bridge no va tan rápido como podría. Evidentemente las limitaciones de Mininet están ahí, pero una opción para mejorar la contención en TCP sería, en lugar de tener un pool compartido de frames para cada socket y tener que usar un mutex que crea mucha contención sería tener un número determinado de frames reservado para cada socket
+- El bridge no va tan rápido como podría. Evidentemente las limitaciones de Mininet están ahí, pero una opción para mejorar la contención en TCP sería, en lugar de tener un pool compartido de frames para cada socket y tener que usar un mutex que crea mucha contención sería tener un número determinado de frames reservado para cada socket.
+
+## Sesión de tutoría [10-03-2026]
+
+Quiza mejor usar dos UMEM, una por cada interfaz.
+
+TAS es una estructura con 8 colas originalmente, pero rentaria que fuesen 2 inicialmente (con un define o algo del palo).
+
+El TAS va despues de saber por que interfaz reenviarlo. Se determina en qué cola ponerlo. Normalmnete se hace con VLANs (vlan 0, cola 0, vlan 1, cola 0).
+
+El frame se va a la cola 0, por ejemplo.
+
+Las colas están unidas por el otro lado a la GCL(Gate Control List)
+
+Del instante 0 al 3, por ejemplo, abrimos una cola. Del 4 al 6 otra. Y luego podemos volver al inicio. Un ejecutivo ciclico en definitiva.
+
+El debate está sobre cuándo hacer la copia en la UMEM o el submit. 
+

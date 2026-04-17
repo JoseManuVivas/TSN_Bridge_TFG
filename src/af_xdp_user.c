@@ -251,7 +251,6 @@ static uint64_t xsk_umem_free_frames(struct xsk_umem_info *umem)
 // Función para configurar el socket AF_XDP
 static struct xsk_socket_info *xsk_configure_socket(struct config *cfg,
 						    struct xsk_umem_info *umem,
-							bool esPrimero,
 							int xsk_map_fd
 						)
 {
@@ -278,25 +277,15 @@ static struct xsk_socket_info *xsk_configure_socket(struct config *cfg,
 	xsk_cfg.libbpf_flags = (custom_xsk) ? XSK_LIBBPF_FLAGS__INHIBIT_PROG_LOAD: 0;
 
 	
-	// Caso para el socket de s1-eth1
-	if (esPrimero) {
+	// Cada socket con su propia UMEM
+
 		ret = xsk_socket__create(&xsk_info->xsk, cfg->ifname,
-                     cfg->xsk_if_queue, umem->umem, &xsk_info->rx,
-                     &xsk_info->tx, &xsk_cfg);
-		// Asignamos los anillos
+					 cfg->xsk_if_queue, umem->umem, &xsk_info->rx,
+					 &xsk_info->tx, &xsk_cfg);
 		xsk_info->fq = umem->fq;
 		xsk_info->cq = umem->cq;
-	
-	} else {
-		// Caso para el socket de s1-eth2
-		// Activamos el flag de UMEM compartida:
-		xsk_cfg.bind_flags |= XDP_SHARED_UMEM;
-		ret = xsk_socket__create_shared(&xsk_info->xsk, cfg->ifname,
-                     cfg->xsk_if_queue, umem->umem, &xsk_info->rx,
-                     &xsk_info->tx, &xsk_info->fq, &xsk_info->cq, &xsk_cfg);
-	}
 
-	if (ret) {
+		if (ret) {
 		fprintf(stderr, "ERROR: Falló la creación del socket %s: %s\n", cfg->ifname, strerror(-ret));
 		goto error_exit;
 	}
@@ -388,7 +377,7 @@ static void complete_tx(struct xsk_socket_info *xsk)
     return (uint16_t)(~sum);
 } */
 
-static bool process_packet(struct xsk_socket_info *xsk_in, struct xsk_socket_info *xsk_out, 
+static void process_packet(struct xsk_socket_info *xsk_in, struct xsk_socket_info *xsk_out, 
 			   uint64_t addr, uint32_t len)
 {
 	// Obtenemos el puntero a la dirección de inicio del paquete
@@ -415,7 +404,7 @@ static bool process_packet(struct xsk_socket_info *xsk_in, struct xsk_socket_inf
 
 	// Verificamos tamaño:
 	if (len < sizeof(struct ethhdr))
-		return false;
+		return;
 
 	struct ethhdr *eth = (struct ethhdr *) pkt;
 
@@ -423,7 +412,7 @@ static bool process_packet(struct xsk_socket_info *xsk_in, struct xsk_socket_inf
 
 	// Verificamos primero los protocolos. Permitimos tambien ARP para aprendizaje
 	if (proto != ETH_P_IP && proto != ETH_P_ARP)
-		return false;
+		return;
 
 	printf("La cabecera Ethernet ocupa %ld bytes\n", sizeof(*eth));
 	// struct ipv6hdr *ipv6 = (struct ipv6hdr *) (eth + 1);
@@ -434,14 +423,14 @@ static bool process_packet(struct xsk_socket_info *xsk_in, struct xsk_socket_inf
 
 		// Verificamos que el tamaño de la cabecera IPv4 sea correcto
 		if (len < sizeof(struct ethhdr) + sizeof(struct iphdr))
-			return false;
+			return;
 
 		// Cambiamos por IPv4
 		struct iphdr *ipv4 = (struct iphdr *) (pkt + sizeof(struct ethhdr));
 
 		if (ipv4->ihl < 5 || ipv4->ihl > 15) {
 			printf("Tamaño de cabecera IPv4 no válido\n");
-			return false;
+			return;
 		}
 
 		/* if (ipv4->protocol != IPPROTO_ICMP) {
@@ -455,13 +444,13 @@ static bool process_packet(struct xsk_socket_info *xsk_in, struct xsk_socket_inf
 		if (ipv4->protocol == IPPROTO_ICMP) {
 
 			if (len < sizeof(struct ethhdr) + (uint32_t)ipv4->ihl * 4 + sizeof(struct icmphdr))
-				return false;
+				return;
 
 			struct icmphdr *icmp = (struct icmphdr *) (pkt + sizeof(struct ethhdr) + ipv4->ihl * 4);
 			if (icmp->type != ICMP_ECHO && icmp->type != ICMP_ECHOREPLY) {
 				printf("Es un paquete ICMP pero no es pregunta o respuesta\n");
 				printf("La cabecera ICMP ocupa %ld bytes\n", sizeof(*icmp));
-				return false;
+				return;
 			}
 		}
 
@@ -504,11 +493,22 @@ forward:
 	// Reservamos espacio para un paquete en el TX ring del socket de salida
 	ret = xsk_ring_prod__reserve(&xsk_out->tx, 1, &tx_idx);
 	if (ret != 1) {
-		return false;
+		return;
 	}
 
-	// Ahora sí, con Zero-copy dejamos la dirección del nuevo paquete y su longitud
-	xsk_ring_prod__tx_desc(&xsk_out->tx, tx_idx)->addr = addr;
+	// Obtenemos un frame libre de la UMEM del socket de salida
+	uint64_t tx_addr = xsk_alloc_umem_frame(xsk_out);
+
+	// Si no hay frames libres, no podemos enviar el paquete, lo que sería un error de diseño porque deberíamos haber reservado suficiente espacio en la Fill Queue para no quedarnos sin frames. En este caso, simplemente hacemos un drop del paquete.
+	if (tx_addr == INVALID_UMEM_FRAME) {
+		return;
+	}
+
+	// Copia del paquete a la dirección del frame que hemos reservado para el socket de salida. Esto es necesario porque en modo copy, el programa XDP no puede acceder a la dirección original del paquete en la UMEM del socket de entrada, por lo que hay que copiarlo a un frame de la UMEM del socket de salida para poder enviarlo.
+	memcpy(xsk_umem__get_data(xsk_out->umem->buffer, tx_addr), pkt, len);
+
+	// Escribimos en el descriptor del TX ring del socket de salida la dirección del frame donde hemos copiado el paquete y su longitud
+	xsk_ring_prod__tx_desc(&xsk_out->tx, tx_idx)->addr = tx_addr;
 	xsk_ring_prod__tx_desc(&xsk_out->tx, tx_idx)->len = len;
 	xsk_ring_prod__submit(&xsk_out->tx, 1);
 
@@ -518,7 +518,7 @@ forward:
 	// Aumentamos en uno el número de paquetes que están "en proceso de envío"
 	xsk_out->outstanding_tx++; 
 	printf( "RESISTIRÉ, ERGUIDO FRENTE A TODO!!\n");
-	return true;
+	return;
 
 }
 
@@ -563,13 +563,13 @@ static void handle_receive_packets(struct xsk_socket_info *xsk_in, struct xsk_so
 		uint64_t addr = xsk_ring_cons__rx_desc(&xsk_in->rx, idx_rx)->addr;
 		uint32_t len = xsk_ring_cons__rx_desc(&xsk_in->rx, idx_rx++)->len;
 
-		// Si el paquete no se ha podido procesar por algún motivo, simplemente liberamos el frame, DROP del paquete
-		if (!process_packet(xsk_in, xsk_out, addr, len)) {
-			addr = addr & ~(FRAME_SIZE - 1);
-			xsk_free_umem_frame(xsk_in, addr);
-			printf("PRIMER PAQUETE LIBERADO\n");
-		}
+		// Procesamos el paquete (intentamos enviarlo al otro socket)
+		process_packet(xsk_in, xsk_out, addr, len);
 
+		// Liberamos el frame de recepción SIEMPRE después de procesarlo
+		// En AF_XDP, los frames consumidos del RX ring deben liberarse
+		addr = addr & ~(FRAME_SIZE - 1);
+		xsk_free_umem_frame(xsk_in, addr);
 	}
 
 	// Avanzamos el puntero de consumidor del Kernel, sirve para indicarle que ya hemos leído los frames del RX ring y el Kernel ya puede usarlos
@@ -677,13 +677,13 @@ static void exit_application(int signal)
 
 int main(int argc, char **argv)
 {	
-	void *packet_buffer; // dirección de inicio de la UMEM
+	void *packet_buffer[MAX_SOCKS]; // dirección de inicio de la UMEM
 	uint64_t packet_buffer_size; // tamaño de la UMEM
 	// establecemos como infinito el límite de memoria que se puede bloquear para que no sea swapeada
 	// por eso hay que ejecutar el programa con sudo
 	struct rlimit rlim = {RLIM_INFINITY, RLIM_INFINITY};
-	// estructura para manejar la UMEM
-	struct xsk_umem_info *umem;
+	// estructura para manejar las dos UMEMs(una por interfaz)
+	struct xsk_umem_info *umem[MAX_SOCKS];
 
 	// Definimos los dos sockets para el bridging
 	// estructura para manejar el socket AF_XDP
@@ -779,29 +779,33 @@ int main(int argc, char **argv)
 	}
 
 	// Reservamos para la UMEM 4096x4096 bytes de memoria
-	packet_buffer_size = NUM_FRAMES * FRAME_SIZE;
+	packet_buffer_size =  NUM_FRAMES * FRAME_SIZE;
 
 	// Reservamos la memoria alineada con el inicio de una página, exigencia del Kernel para UMEM.
-	if (posix_memalign(&packet_buffer,
-			   getpagesize(), /* PAGE_SIZE aligned */
+	for (int i = 0; i < MAX_SOCKS; i++) {
+		if (posix_memalign(&packet_buffer[i],
+				   getpagesize(), /* PAGE_SIZE aligned */
 			   packet_buffer_size)) {
-		fprintf(stderr, "ERROR: Can't allocate buffer memory \"%s\"\n",
-			strerror(errno));
-		exit(EXIT_FAILURE);
+			fprintf(stderr, "ERROR: Can't allocate buffer memory \"%s\"\n",
+				strerror(errno));
+			exit(EXIT_FAILURE);
+		}
 	}
 
+
 	// Inicializamos la UMEM
-	umem = configure_xsk_umem(packet_buffer, packet_buffer_size);
-	if (umem == NULL) {
-		fprintf(stderr, "ERROR: Can't create umem \"%s\"\n",
+	for (int i = 0; i < MAX_SOCKS; i++) {
+		umem[i] = configure_xsk_umem(packet_buffer[i], packet_buffer_size);
+		if (umem[i] == NULL) {
+			fprintf(stderr, "ERROR: Can't create umem \"%s\"\n",
 			strerror(errno));
-		exit(EXIT_FAILURE);
+			exit(EXIT_FAILURE);
+		}
 	}
-	bool esPrimero = true;
+
 	// Creamos los sockets AF_XDP
 	for (int i = 0; i < MAX_SOCKS; i++) {
-		xsk_socket[i] = xsk_configure_socket(&cfgs[i], umem, esPrimero, xsk_map_fd[i]);
-		esPrimero = false;
+		xsk_socket[i] = xsk_configure_socket(&cfgs[i], umem[i], xsk_map_fd[i]);
 		if (xsk_socket[i] == NULL) {
 			fprintf(stderr, "ERROR: Can't create xsk socket \"%s\"\n",
 				strerror(errno));
@@ -834,10 +838,15 @@ int main(int argc, char **argv)
 		free(xsk_socket[i]);
 	}
 	// Destruimos el mutex
-	pthread_mutex_destroy(&umem->frame_lock);
-	xsk_umem__delete(umem->umem);
-	free(umem);
-	free(packet_buffer);
+	for (int i = 0; i < MAX_SOCKS; i++) {
+		pthread_mutex_destroy(&umem[i]->frame_lock);
+		xsk_umem__delete(umem[i]->umem);
+		free(umem[i]);
+	}
+
+	for (int i = 0; i < MAX_SOCKS; i++) {
+		free(packet_buffer[i]);
+	}
 
 	return EXIT_OK;
 }
