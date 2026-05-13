@@ -2,7 +2,6 @@ from mininet.topo import Topo
 from mininet.net import Mininet
 from mininet.cli import CLI
 from mininet.node import Host
-from mininet.node import OVSSwitch
 from mininet.nodelib import LinuxBridge
 
 # Esta es la pieza que crea las etiquetas VLAN. No la toques, 
@@ -25,9 +24,9 @@ class MyTopology(Topo):
         # 1. Creamos el Bridge (que para Mininet es un Switch)
         s1 = self.addSwitch('s1', cls=LinuxBridge) 
 
-        # 2. Creamos dos Hosts con VLAN 10
-        h1 = self.addHost('h1', ip='10.0.0.1/24') # Sin cls=VLANHost
-        h2 = self.addHost('h2', ip='10.0.0.2/24')
+        # 2. Creamos dos Hosts: h1 en VLAN 1, h2 en VLAN 2
+        h1 = self.addHost('h1', cls=VLANHost, vlan_id=1, ip='10.0.0.1/24')
+        h2 = self.addHost('h2', cls=VLANHost, vlan_id=1, ip='10.0.0.2/24')
 
         # 3. Los conectamos al Bridge
         self.addLink(h1, s1)
@@ -49,12 +48,12 @@ if __name__ == '__main__':
 
     # MODO SEGURO: Desactivar TODAS las optimizaciones que rompen XDP
     # Se lo hacemos a los hosts Y a las interfaces del switch
-    interfaces = ['h1-eth0', 'h2-eth0', 's1-eth1', 's1-eth2']
+    interfaces = ['h1-eth0', 'h1-eth0.1', 'h2-eth0', 'h2-eth0.1', 's1-eth1', 's1-eth2']
     print("*** Blindando interfaces contra Kernel Panics...")
     for intf in interfaces:
         # Buscamos en qué nodo está la interfaz para mandarle el comando
         node = h1 if 'h1' in intf else (h2 if 'h2' in intf else s1)
-        node.cmd('ethtool -K %s tx off rx off gso off gro off lro off' % intf)
+        node.cmd('ethtool -K %s tx off rx off gso off gro off lro off txvlan off rxvlan off' % intf)
         node.cmd('ip link set %s promisc on' % intf)
     
     CLI(net) # Esto te deja una consola para que tú pruebes cosas

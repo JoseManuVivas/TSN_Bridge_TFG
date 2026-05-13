@@ -269,7 +269,7 @@ Quiza mejor usar dos UMEM, una por cada interfaz.
 
 TAS es una estructura con 8 colas originalmente, pero rentaria que fuesen 2 inicialmente (con un define o algo del palo).
 
-El TAS va despues de saber por que interfaz reenviarlo. Se determina en qué cola ponerlo. Normalmnete se hace con VLANs (vlan 0, cola 0, vlan 1, cola 0).
+El TAS va despues de saber por que interfaz reenviarlo. Se determina en qué cola ponerlo. Normalmente se hace con VLANs (vlan 0, cola 0, vlan 1, cola 0).
 
 El frame se va a la cola 0, por ejemplo.
 
@@ -278,4 +278,86 @@ Las colas están unidas por el otro lado a la GCL(Gate Control List)
 Del instante 0 al 3, por ejemplo, abrimos una cola. Del 4 al 6 otra. Y luego podemos volver al inicio. Un ejecutivo ciclico en definitiva.
 
 El debate está sobre cuándo hacer la copia en la UMEM o el submit. 
+
+## Sesión [13-05-2026]
+### Parseo de VLANs como paso previo al TAS
+
+**Objetivo:** Parsear la etiqueta 802.1Q en el bridge para determinar a qué cola de salida pertenece cada paquete.
+
+#### Notas técnicas
+
+##### Estructura `struct vlan_hdr` y el formato 802.1Q
+
+Un header 802.1Q son exactamente 4 bytes que se insertan entre la cabecera Ethernet y el EtherType original:
+
+```
+Sin etiqueta VLAN (frame normal):
+
+  0     6     12    14
+  ┌─────┬─────┬─────┬──────────────────────────────────────┐
+  │ DST │ SRC │Type │         Payload (IP, ARP...)         │
+  │ MAC │ MAC │0800 │                                      │
+  └─────┴─────┴─────┴──────────────────────────────────────┘
+   6B    6B    2B
+
+
+Con etiqueta 802.1Q (frame VLAN):
+
+  0     6     12    14         16    18
+  ┌─────┬─────┬─────┬──────────┬─────┬──────────────────────────┐
+  │ DST │ SRC │8100 │   TCI    │0800 │   Payload (IP, ARP...)   │
+  │ MAC │ MAC │     │          │     │                          │
+  └─────┴─────┴─────┴──────────┴─────┴──────────────────────────┘
+   6B    6B    2B       2B       2B
+              │         │         │
+              │         │         └─ h_vlan_encapsulated_proto
+              │         │            (EtherType real: IP, ARP...)
+              │         │
+              │         └─ h_vlan_TCI (2 bytes):
+              │              ┌───┬───┬───┬─────────────────────┐
+              │              │ P │ P │ P │ D │ V  V  V  V  V   │
+              │              │ C │ C │ C │ E │ I  I  I  I  I   │
+              │              │ P │ P │ P │ I │ D  D  D  D  D   │
+              │              └───┴───┴───┴───┴─────────────────┘
+              │               bit15       bit12 bit11        bit0
+              │               └───3b───┘  └b┘  └────12b────┘
+              │                 Prioridad  DEI     VLAN ID
+              │
+              └─ eth->h_proto = 0x8100
+                 ("lo que sigue es una cabecera VLAN")
+```
+
+- **PCP** (Priority Code Point, 3 bits): prioridad del tráfico, de 0 a 7. Fundamental para TSN — aquí es donde se mapea la clase de tráfico.
+- **DEI** (Drop Eligible Indicator, 1 bit): indica si el frame puede descartarse en caso de congestión. Casi siempre 0.
+- **VID** (VLAN Identifier, 12 bits): el número de VLAN, de 0 a 4095. Se extrae con `ntohs(vhdr->h_vlan_TCI) & 0x0FFF`.
+- **`h_vlan_encapsulated_proto`**: el EtherType real (IPv4, ARP...) que sin etiqueta estaría en el byte 12-13 y con etiqueta se desplaza al byte 16-17.
+
+`<linux/if_vlan.h>` no exporta `struct vlan_hdr` en espacio de usuario en kernels modernos, por lo que se define manualmente (son 4 bytes fijos del estándar 802.1Q).
+
+##### Problema: TX VLAN Offloading en interfaces veth
+
+Al usar `VLANHost` en Mininet, el kernel activa **TX VLAN offloading** en las interfaces de los hosts: en lugar de incrustar los 4 bytes del header 802.1Q en los datos de la trama, los mueve a un metadato interno del SKB (`skb->vlan_tci`). Cuando la trama cruza el par veth hacia el switch, llega sin la etiqueta en los datos. El programa AF_XDP en modo copia solo copia los datos del paquete, no los metadatos del SKB, por lo que recibe tramas de 42 bytes (ARP sin VLAN) en lugar de 46 bytes.
+
+Consecuencia: el bridge reenvía el ARP sin etiqueta, h2 lo recibe en `h2-eth0` (sin IP configurada) y no responde. El ping nunca completa.
+
+**Solución:** Deshabilitar el offloading VLAN explícitamente en `topo.py`:
+```bash
+ethtool -K <intf> txvlan off rxvlan off
+```
+- `txvlan off` en los hosts: obliga al kernel a incrustar los 4 bytes del header 802.1Q en los datos de la trama.
+- `rxvlan off` en el switch: evita que el receptor extraiga la etiqueta antes de que XDP la vea.
+
+##### Cuándo hacer la copia a la UMEM de salida
+
+La copia al frame de salida debe hacerse **en el momento del encolado**, no cuando la puerta TAS se abra. La razón: al final de cada iteración del bucle de recepción, el frame de entrada se libera inmediatamente a la Fill Queue para que el kernel pueda reutilizarlo. Si se difiere la copia hasta el flush de la cola, el frame original ya podría estar siendo sobreescrito con un paquete nuevo.
+
+Flujo correcto:
+1. Llega paquete → `process_packet` parsea VLAN → obtiene `queue_idx`
+2. `xsk_alloc_umem_frame(xsk_out)` → reserva frame en la UMEM de salida
+3. `memcpy` del paquete al frame de salida → **copia inmediata**
+4. Descriptor `(addr, len)` se encola en `sw_queue[queue_idx]`
+5. Frame de entrada se libera (`xsk_free_umem_frame`)
+6. Cuando la puerta TAS abra: `flush_sw_queue` hace el `submit` al TX ring
+
+Lo que controlará el TAS no es cuándo se copia, sino cuándo se hace el `submit` al TX ring.
 

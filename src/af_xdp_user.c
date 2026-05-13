@@ -28,6 +28,11 @@
 #include <netinet/ip.h>
 // #include <linux/icmpv6.h>
 #include <netinet/ip_icmp.h>
+/* 802.1Q tag: 2B TCI (PCP 3b | DEI 1b | VID 12b) + 2B inner EtherType */
+struct vlan_hdr {
+	__be16 h_vlan_TCI;
+	__be16 h_vlan_encapsulated_proto;
+};
 
 #include "../common/common_params.h"
 #include "../common/common_user_bpf_xdp.h"
@@ -409,6 +414,20 @@ static void process_packet(struct xsk_socket_info *xsk_in, struct xsk_socket_inf
 	struct ethhdr *eth = (struct ethhdr *) pkt;
 
 	uint16_t proto = ntohs(eth->h_proto);
+	uint16_t vlan_id = 0;
+	size_t l3_offset = sizeof(struct ethhdr);
+
+	// Parseo de etiqueta 802.1Q
+	if (proto == ETH_P_8021Q) {
+		if (len < sizeof(struct ethhdr) + sizeof(struct vlan_hdr))
+			return;
+		struct vlan_hdr *vhdr = (struct vlan_hdr *)(pkt + sizeof(struct ethhdr));
+		vlan_id = ntohs(vhdr->h_vlan_TCI) & 0x0FFF;
+		proto   = ntohs(vhdr->h_vlan_encapsulated_proto);
+		l3_offset += sizeof(struct vlan_hdr);
+		printf("[VLAN] ID=%u  proto_interno=0x%04x\n", vlan_id, proto);
+		fflush(stdout);
+	}
 
 	// Verificamos primero los protocolos. Permitimos tambien ARP para aprendizaje
 	if (proto != ETH_P_IP && proto != ETH_P_ARP)
@@ -422,11 +441,11 @@ static void process_packet(struct xsk_socket_info *xsk_in, struct xsk_socket_inf
 	} else {
 
 		// Verificamos que el tamaño de la cabecera IPv4 sea correcto
-		if (len < sizeof(struct ethhdr) + sizeof(struct iphdr))
+		if (len < l3_offset + sizeof(struct iphdr))
 			return;
 
 		// Cambiamos por IPv4
-		struct iphdr *ipv4 = (struct iphdr *) (pkt + sizeof(struct ethhdr));
+		struct iphdr *ipv4 = (struct iphdr *) (pkt + l3_offset);
 
 		if (ipv4->ihl < 5 || ipv4->ihl > 15) {
 			printf("Tamaño de cabecera IPv4 no válido\n");
@@ -443,10 +462,10 @@ static void process_packet(struct xsk_socket_info *xsk_in, struct xsk_socket_inf
 
 		if (ipv4->protocol == IPPROTO_ICMP) {
 
-			if (len < sizeof(struct ethhdr) + (uint32_t)ipv4->ihl * 4 + sizeof(struct icmphdr))
+			if (len < l3_offset + (uint32_t)ipv4->ihl * 4 + sizeof(struct icmphdr))
 				return;
 
-			struct icmphdr *icmp = (struct icmphdr *) (pkt + sizeof(struct ethhdr) + ipv4->ihl * 4);
+			struct icmphdr *icmp = (struct icmphdr *) (pkt + l3_offset + ipv4->ihl * 4);
 			if (icmp->type != ICMP_ECHO && icmp->type != ICMP_ECHOREPLY) {
 				printf("Es un paquete ICMP pero no es pregunta o respuesta\n");
 				printf("La cabecera ICMP ocupa %ld bytes\n", sizeof(*icmp));
