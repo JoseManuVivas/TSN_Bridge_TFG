@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: GPL-2.0 */
+#define _GNU_SOURCE
 
 #include <assert.h>
 #include <errno.h>
@@ -10,6 +11,9 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#ifndef CLOCK_TAI
+#define CLOCK_TAI 11  /* Linux >= 3.10, definido en <time.h> con _GNU_SOURCE */
+#endif
 #include <unistd.h>
 #include <pthread.h>
 #include <stdatomic.h>
@@ -42,7 +46,24 @@ struct vlan_hdr {
 #define FRAME_SIZE         XSK_UMEM__DEFAULT_FRAME_SIZE
 #define RX_BATCH_SIZE      64
 #define INVALID_UMEM_FRAME UINT64_MAX
-#define MAX_SOCKS 2
+#define MAX_SOCKS          2
+#define NUM_TX_QUEUES      2
+
+/* GCL: duración de cada slot en nanosegundos */
+#define GCL_SLOT_NS        1000000  /* 1 ms por slot */
+
+/* Una entrada del Gate Control List: qué colas están abiertas y cuánto dura la ventana */
+struct gcl_entry {
+	uint8_t  gate_mask;   /* bitmask: bit N = cola N abierta */
+	uint64_t duration_ns;
+};
+
+/* Tabla GCL hardcodeada: ciclo de 2ms, un slot por cola */
+static const struct gcl_entry gcl[] = {
+	{ .gate_mask = 0x01, .duration_ns = GCL_SLOT_NS }, /* slot 0: solo cola 0 */
+	{ .gate_mask = 0x02, .duration_ns = GCL_SLOT_NS }, /* slot 1: solo cola 1 */
+};
+#define GCL_LEN (sizeof(gcl) / sizeof(gcl[0]))
 
 static struct xdp_program *prog[MAX_SOCKS]; // un programa XDP por socket
 int xsk_map_fd[MAX_SOCKS];
@@ -92,6 +113,16 @@ struct xsk_umem_info {
 	void *buffer;
 };
 
+/* Cola software de TX SPSC (Single Producer, Single Consumer) lock-free.
+ * El hilo de RX es el único productor (escribe head); el hilo GCL es el
+ * único consumidor (escribe tail). Con variables _Atomic no hace falta mutex. */
+struct sw_queue {
+	struct xdp_desc ring[NUM_FRAMES];
+	_Atomic uint32_t head;   /* solo el productor escribe aquí */
+	_Atomic uint32_t tail;   /* solo el consumidor escribe aquí */
+	_Atomic uint32_t drops;  /* paquetes descartados por cola llena */
+};
+
 // Estructura que define la información de un socket en cada interfaz
 struct xsk_socket_info {
 	struct xsk_ring_cons rx;
@@ -103,6 +134,7 @@ struct xsk_socket_info {
 
 	uint32_t outstanding_tx;
 
+	struct sw_queue sw_queues[NUM_TX_QUEUES];
 };
 
 // Estructura para pasar argumentos a cada hilo que hará polling en un socket
@@ -110,6 +142,11 @@ struct thread_args {
     struct config *cfg;
     struct xsk_socket_info *xsk_in;
     struct xsk_socket_info *xsk_out;
+};
+
+// Estructura para pasar argumentos al hilo GCL
+struct gcl_args {
+    struct xsk_socket_info *xsk_sockets[MAX_SOCKS];
 };
 
 static const char *__doc__ __attribute__((unused)) = "AF_XDP kernel bypass example\n";
@@ -251,6 +288,52 @@ static uint64_t xsk_umem_free_frames(struct xsk_umem_info *umem)
 	pthread_mutex_unlock(&umem->frame_lock);
 	// Devolvemos el número de frames disponibles
 	return ret;
+}
+
+/* Encola un frame ya copiado en la UMEM en la cola software q.
+ * Patrón SPSC lock-free: el productor (hilo RX) es el único que escribe head;
+ * el consumidor (hilo GCL) es el único que escribe tail.
+ * Devuelve false y cuenta el drop si la cola está llena. */
+static bool sw_queue_enqueue(struct sw_queue *q, uint64_t addr, uint32_t len)
+{
+	/* head se lee relaxed: nadie más lo modifica en este lado */
+	uint32_t head = atomic_load_explicit(&q->head, memory_order_relaxed);
+	/* tail se lee con acquire para sincronizar con el release del consumidor
+	 * y ver los huecos que ya liberó */
+	uint32_t tail = atomic_load_explicit(&q->tail, memory_order_acquire);
+
+	/* Cola llena: descartamos el paquete y contamos el drop */
+	if (head - tail >= NUM_FRAMES) {
+		atomic_fetch_add_explicit(&q->drops, 1, memory_order_relaxed);
+		return false;
+	}
+
+	/* Escribimos el descriptor ANTES de publicar el nuevo head */
+	q->ring[head % NUM_FRAMES] = (struct xdp_desc){ .addr = addr, .len = len };
+	/* release: garantiza que el consumidor vea el slot escrito cuando lea head */
+	atomic_store_explicit(&q->head, head + 1, memory_order_release);
+	return true;
+}
+
+/* Desencola un frame de la cola software q y escribe el descriptor en *desc.
+ * Devuelve false si la cola está vacía. */
+static bool sw_queue_dequeue(struct sw_queue *q, struct xdp_desc *desc)
+{
+	/* tail se lee relaxed: nadie más lo modifica en este lado */
+	uint32_t tail = atomic_load_explicit(&q->tail, memory_order_relaxed);
+	/* head se lee con acquire para sincronizar con el release del productor
+	 * y ver los slots que ya escribió */
+	uint32_t head = atomic_load_explicit(&q->head, memory_order_acquire);
+
+	/* Cola vacía */
+	if (tail == head)
+		return false;
+
+	/* Leemos el descriptor ANTES de publicar el nuevo tail */
+	*desc = q->ring[tail % NUM_FRAMES];
+	/* release: garantiza que el productor vea el hueco liberado cuando lea tail */
+	atomic_store_explicit(&q->tail, tail + 1, memory_order_release);
+	return true;
 }
 
 // Función para configurar el socket AF_XDP
@@ -397,22 +480,10 @@ static void process_packet(struct xsk_socket_info *xsk_in, struct xsk_socket_inf
 	 *   ICMPV6_ECHO_REPLY
 	 * - Recalculate the icmp checksum */
 
-	printf("Recibido paquete de longitud %u\n", len);
-
-	// Bridge simple entre dos interfaces
-	int ret;
-	uint32_t tx_idx = 0;
-
-	// Aritmética de punteros básica
-
-	// DEBUG: Vamos a usar una forma más básica de calcular el tamaño de las cabeceras
-
-	// Verificamos tamaño:
 	if (len < sizeof(struct ethhdr))
 		return;
 
 	struct ethhdr *eth = (struct ethhdr *) pkt;
-
 	uint16_t proto = ntohs(eth->h_proto);
 	uint16_t vlan_id = 0;
 	size_t l3_offset = sizeof(struct ethhdr);
@@ -425,118 +496,49 @@ static void process_packet(struct xsk_socket_info *xsk_in, struct xsk_socket_inf
 		vlan_id = ntohs(vhdr->h_vlan_TCI) & 0x0FFF;
 		proto   = ntohs(vhdr->h_vlan_encapsulated_proto);
 		l3_offset += sizeof(struct vlan_hdr);
-		printf("[VLAN] ID=%u  proto_interno=0x%04x\n", vlan_id, proto);
-		fflush(stdout);
+		printf("[VLAN] ID=%u  cola=%u\n", vlan_id, vlan_id > 0 ? (vlan_id - 1) % NUM_TX_QUEUES : 0);
 	}
 
-	// Verificamos primero los protocolos. Permitimos tambien ARP para aprendizaje
 	if (proto != ETH_P_IP && proto != ETH_P_ARP)
 		return;
 
-	printf("La cabecera Ethernet ocupa %ld bytes\n", sizeof(*eth));
-	// struct ipv6hdr *ipv6 = (struct ipv6hdr *) (eth + 1);
-	if (proto == ETH_P_ARP) {
-		// Para hacer menos verificaciones
+	if (proto == ETH_P_ARP)
 		goto forward;
-	} else {
 
-		// Verificamos que el tamaño de la cabecera IPv4 sea correcto
-		if (len < l3_offset + sizeof(struct iphdr))
-			return;
-
-		// Cambiamos por IPv4
-		struct iphdr *ipv4 = (struct iphdr *) (pkt + l3_offset);
-
-		if (ipv4->ihl < 5 || ipv4->ihl > 15) {
-			printf("Tamaño de cabecera IPv4 no válido\n");
-			return;
-		}
-
-		/* if (ipv4->protocol != IPPROTO_ICMP) {
-			printf("Es un paquete IPv4 pero no es ICMP\n");
-			return false;
-		} */
-
-		printf("La cabecera IPv4 ocupa %d bytes\n", ipv4->ihl * 4);
-
-
-		if (ipv4->protocol == IPPROTO_ICMP) {
-
-			if (len < l3_offset + (uint32_t)ipv4->ihl * 4 + sizeof(struct icmphdr))
-				return;
-
-			struct icmphdr *icmp = (struct icmphdr *) (pkt + l3_offset + ipv4->ihl * 4);
-			if (icmp->type != ICMP_ECHO && icmp->type != ICMP_ECHOREPLY) {
-				printf("Es un paquete ICMP pero no es pregunta o respuesta\n");
-				printf("La cabecera ICMP ocupa %ld bytes\n", sizeof(*icmp));
-				return;
-			}
-		}
-
-		// struct icmp6hdr *icmp = (struct icmp6hdr *) (ipv4 + 1);
-
-		// Comprobaciones básicas de seguridad. Verificamos que:
-		// La cabecera IPv4 especifique que el protocolo concreto que maneja es ICMP (para pings)
-		// Es un mensaje ECHO REQUEST
-
-		// Guardamos el destino original (nosotros) en tmp_mac
-		fflush(stdout);
-	}
-
-	// DEBUG: Quitamos todo esto
-	
-	// Eliminamos el código que intercambia cabeceras
-	/* memcpy(tmp_mac, eth->h_dest, ETH_ALEN);
-	// Copiamos el origen original en el nuevo destino (para devolverlo)
-	memcpy(eth->h_dest, eth->h_source, ETH_ALEN);
-	// Copiamos el destino original en el nuevo origen
-	memcpy(eth->h_source, tmp_mac, ETH_ALEN);
-
-	memcpy(&tmp_ip, &ipv4->saddr, sizeof(tmp_ip));
-	memcpy(&ipv4->saddr, &ipv4->daddr, sizeof(tmp_ip));
-	memcpy(&ipv4->daddr, &tmp_ip, sizeof(tmp_ip)); */
-	
-
-	// DEBUG: De momento vamos a retirar el checksum
-	/* csum_replace2(&icmp->checksum,
-				htons(ICMP_ECHO << 8),
-				htons(ICMP_ECHOREPLY << 8)); */
-
-	// icmp->checksum = 0;
-
-	/* Here we sent the packet out of the receive port. Note that
-		* we allocate one entry and schedule it. Your design would be
-		* faster if you do batch processing/transmission */
-		
-forward: 
-	// Reservamos espacio para un paquete en el TX ring del socket de salida
-	ret = xsk_ring_prod__reserve(&xsk_out->tx, 1, &tx_idx);
-	if (ret != 1) {
+	if (len < l3_offset + sizeof(struct iphdr))
 		return;
-	}
 
+	struct iphdr *ipv4 = (struct iphdr *)(pkt + l3_offset);
+
+	if (ipv4->ihl < 5 || ipv4->ihl > 15)
+		return;
+
+	if (ipv4->protocol == IPPROTO_ICMP) {
+		if (len < l3_offset + (uint32_t)ipv4->ihl * 4 + sizeof(struct icmphdr))
+			return;
+		struct icmphdr *icmp = (struct icmphdr *)(pkt + l3_offset + ipv4->ihl * 4);
+		if (icmp->type != ICMP_ECHO && icmp->type != ICMP_ECHOREPLY)
+			return;
+	}
+		
+forward:
 	// Obtenemos un frame libre de la UMEM del socket de salida
 	uint64_t tx_addr = xsk_alloc_umem_frame(xsk_out);
-
-	// Si no hay frames libres, no podemos enviar el paquete, lo que sería un error de diseño porque deberíamos haber reservado suficiente espacio en la Fill Queue para no quedarnos sin frames. En este caso, simplemente hacemos un drop del paquete.
-	if (tx_addr == INVALID_UMEM_FRAME) {
+	if (tx_addr == INVALID_UMEM_FRAME)
 		return;
-	}
 
-	// Copia del paquete a la dirección del frame que hemos reservado para el socket de salida. Esto es necesario porque en modo copy, el programa XDP no puede acceder a la dirección original del paquete en la UMEM del socket de entrada, por lo que hay que copiarlo a un frame de la UMEM del socket de salida para poder enviarlo.
+	// Copiamos el paquete al frame de la UMEM del socket de salida
 	memcpy(xsk_umem__get_data(xsk_out->umem->buffer, tx_addr), pkt, len);
 
-	// Escribimos en el descriptor del TX ring del socket de salida la dirección del frame donde hemos copiado el paquete y su longitud
-	xsk_ring_prod__tx_desc(&xsk_out->tx, tx_idx)->addr = tx_addr;
-	xsk_ring_prod__tx_desc(&xsk_out->tx, tx_idx)->len = len;
-	xsk_ring_prod__submit(&xsk_out->tx, 1);
-
-	printf("Se ha escrito correctamente en el TX Ring\n");
-	fflush(stdout);
-
-	// Aumentamos en uno el número de paquetes que están "en proceso de envío"
-	xsk_out->outstanding_tx++; 
-	printf( "RESISTIRÉ, ERGUIDO FRENTE A TODO!!\n");
+	// Encolamos en la cola software según el VLAN ID; el hilo GCL se encargará de enviarlo al kernel
+	// VLAN 1 → cola 0, VLAN 2 → cola 1, sin VLAN (vlan_id=0) → cola 0
+	int q = vlan_id > 0 ? (vlan_id - 1) % NUM_TX_QUEUES : 0;
+	if (!sw_queue_enqueue(&xsk_out->sw_queues[q], tx_addr, len)) {
+		// Cola llena: liberamos el frame que acabamos de reservar
+		xsk_free_umem_frame(xsk_out, tx_addr);
+		printf("[DROP] cola %d llena (drops=%u)\n", q,
+		       atomic_load_explicit(&xsk_out->sw_queues[q].drops, memory_order_relaxed));
+	}
 	return;
 
 }
@@ -593,11 +595,6 @@ static void handle_receive_packets(struct xsk_socket_info *xsk_in, struct xsk_so
 
 	// Avanzamos el puntero de consumidor del Kernel, sirve para indicarle que ya hemos leído los frames del RX ring y el Kernel ya puede usarlos
 	xsk_ring_cons__release(&xsk_in->rx, rcvd);
-
-	printf("Transmisión completada!!\n");
-	fflush(stdout);
-	complete_tx(xsk_out);
-	printf("Ring TX liberado\n");
   }
 
 // Función que se ejecutará en cada hilo, que hace polling de un socket concreto
@@ -680,6 +677,88 @@ static double calc_period(struct stats_record *r, struct stats_record *p)
 
 	return period_;
 } */
+
+static void *gcl_thread(void *arg)
+{
+    struct gcl_args *targs = arg;
+
+    /* Duración total del ciclo GCL: suma de todos los slots */
+    uint64_t cycle_ns = 0;
+    for (int i = 0; i < GCL_LEN; i++)
+        cycle_ns += gcl[i].duration_ns;
+
+    while (!global_exit) {
+        /* Obtenemos el tiempo actual en nanosegundos con CLOCK_TAI */
+        struct timespec ts;
+        if (clock_gettime(CLOCK_TAI, &ts) < 0) {
+            perror("clock_gettime(CLOCK_TAI)");
+            break;
+        }
+        uint64_t now_ns = (uint64_t)ts.tv_sec * 1000000000ULL + ts.tv_nsec;
+
+        /* Posición dentro del ciclo actual */
+        uint64_t pos = now_ns % cycle_ns;
+
+        /* Buscamos en qué slot del GCL estamos */
+        int slot = 0;
+        uint64_t slot_start = 0;
+        for (int i = 0; i < GCL_LEN; i++) {
+            if (pos < slot_start + gcl[i].duration_ns) {
+                slot = i;
+                break;
+            }
+            slot_start += gcl[i].duration_ns;
+        }
+
+        uint8_t gate_mask = gcl[slot].gate_mask;
+
+        /* Para cada socket, drenamos las colas cuya puerta está abierta */
+        for (int s = 0; s < MAX_SOCKS; s++) {
+            struct xsk_socket_info *xsk = targs->xsk_sockets[s];
+
+            for (int q = 0; q < NUM_TX_QUEUES; q++) {
+                if (!(gate_mask & (1 << q)))
+                    continue;
+
+                struct xdp_desc desc;
+                while (sw_queue_dequeue(&xsk->sw_queues[q], &desc)) {
+                    /* Comprobamos si seguimos dentro del slot antes de enviar */
+                    if (clock_gettime(CLOCK_TAI, &ts) < 0)
+                        break;
+                    uint64_t now2 = (uint64_t)ts.tv_sec * 1000000000ULL + ts.tv_nsec;
+                    uint64_t pos2 = now2 % cycle_ns;
+                    /* pos2 < slot_start detecta el wraparound del último slot */
+                    if (pos2 >= slot_start + gcl[slot].duration_ns || pos2 < slot_start) {
+                        /* Slot expirado: descartamos el frame y paramos */
+                        xsk_free_umem_frame(xsk, desc.addr);
+                        break;
+                    }
+
+                    uint32_t tx_idx;
+                    /* Si el TX ring del kernel está lleno, descartamos el frame */
+                    if (xsk_ring_prod__reserve(&xsk->tx, 1, &tx_idx) != 1) {
+                        xsk_free_umem_frame(xsk, desc.addr);
+                        break;
+                    }
+                    *xsk_ring_prod__tx_desc(&xsk->tx, tx_idx) = desc;
+                    xsk_ring_prod__submit(&xsk->tx, 1);
+                    xsk->outstanding_tx++;
+                }
+            }
+
+            complete_tx(xsk);
+        }
+
+        /* Dormimos hasta el final del slot actual */
+        uint64_t remaining_ns = slot_start + gcl[slot].duration_ns - pos;
+        struct timespec sleep_ts = {
+            .tv_sec  = remaining_ns / 1000000000ULL,
+            .tv_nsec = remaining_ns % 1000000000ULL,
+        };
+        nanosleep(&sleep_ts, NULL);
+    }
+    return NULL;
+}
 
 // Rutina de captura de señal SIGINT, para salir del programa limpiamente al pulsar Ctrl+C
 static void exit_application(int signal)
@@ -835,11 +914,10 @@ int main(int argc, char **argv)
 	/* // Función principal de recepción y procesamiento de paquetes.
 	rx_and_process(cfgs, xsk_socket); */
 
-	// Creamos cada thread
+	// Creamos los hilos RX
 	pthread_t threads[MAX_SOCKS];
 	struct thread_args targs[MAX_SOCKS];
 
-	// Definimos los argumentos de cada thread
 	for (int i = 0; i < MAX_SOCKS; i++) {
 		targs[i].cfg     = &cfgs[i];
 		targs[i].xsk_in  = xsk_socket[i];
@@ -847,9 +925,17 @@ int main(int argc, char **argv)
 		pthread_create(&threads[i], NULL, rx_thread, &targs[i]);
 	}
 
-	// Esperamos a que ambos threads terminen (cuando global_exit = true)
+	// Creamos el hilo GCL
+	pthread_t gcl_tid;
+	struct gcl_args gargs;
+	for (int i = 0; i < MAX_SOCKS; i++)
+		gargs.xsk_sockets[i] = xsk_socket[i];
+	pthread_create(&gcl_tid, NULL, gcl_thread, &gargs);
+
+	// Esperamos a que todos los hilos terminen (cuando global_exit = true)
 	for (int i = 0; i < MAX_SOCKS; i++)
 		pthread_join(threads[i], NULL);
+	pthread_join(gcl_tid, NULL);
 
 	// Limpiamos los sockets
 	for (int i = 0; i < MAX_SOCKS; i++) {

@@ -361,3 +361,18 @@ Flujo correcto:
 
 Lo que controlará el TAS no es cuándo se copia, sino cuándo se hace el `submit` al TX ring.
 
+## Sesión [19-05-2026]
+### Implementación de las 2 colas de TX
+**Objetivo:** Implementar las dos colas, con las funciones correspondientes para que los paquetes, al copiarse al frame de salida, se encolen en ella y esperen a que su ventana de tiempo se abra.
+
+#### Notas técnicas
+¿Cómo lo haremos? Actualmente, en la función ```process_packet```, cuando copiamos un frame en la UMEM del socket de salida, directamente añadimos su descriptor al TX ring de salida, lo que hace que nada más copiarse, se pretende reenviar. Nosotros no buscamos eso ahora, queremos que al copiarse en la UMEM del socket de salida, el descriptor del frame se retenga en la cola, hasta que sea el momento de abrirse. Para ello, en ```xsk_socket_info``` añadiremos colas software en memoria de espacio de usuario. Cada cola será un array circular de descriptores.
+
+Inicialmente, definimos la estructura ```sw_queue``` que se asociarán (una por VLANs configuradas) a ```xsk_socket_info```. Esta estructura es una cola circular sencilla con *head* y *tail*, de ```xdp_desc```.
+
+No hace falta inicializar `head` y `tail` de las colas, ya que ```calloc``` ya inicializa todos los bytes a 0.
+
+Añadimos un campo ```drops``` a la estructura ```sw_queue``` que contará los paquetes que se descarten por cola llena.
+
+Para implementar la GCL, consideraremos cada entrada de la tabla como una "ventana de tiempo", que estará compuesta por su duración en milisegundos y una bitmask que especifica las colas que están abiertas en esa ventana.
+
