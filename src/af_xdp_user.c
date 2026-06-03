@@ -21,6 +21,7 @@
 #include <sys/resource.h>
 
 #include <bpf/bpf.h>
+#include <bpf/libbpf.h>
 #include <xdp/xsk.h>
 #include <xdp/libxdp.h>
 
@@ -47,10 +48,7 @@ struct vlan_hdr {
 #define RX_BATCH_SIZE      64
 #define INVALID_UMEM_FRAME UINT64_MAX
 #define MAX_SOCKS          2
-#define NUM_TX_QUEUES      2
-
-/* GCL: duración de cada slot en nanosegundos */
-#define GCL_SLOT_NS        1000000  /* 1 ms por slot */
+#define NUM_TX_QUEUES      8
 
 /* Una entrada del Gate Control List: qué colas están abiertas y cuánto dura la ventana */
 struct gcl_entry {
@@ -58,15 +56,16 @@ struct gcl_entry {
 	uint64_t duration_ns;
 };
 
-/* Tabla GCL hardcodeada: ciclo de 2ms, un slot por cola */
+/* Tabla GCL hardcodeada: ciclo de 10ms asimétrico para demostrar gating */
 static const struct gcl_entry gcl[] = {
-	{ .gate_mask = 0x01, .duration_ns = GCL_SLOT_NS }, /* slot 0: solo cola 0 */
-	{ .gate_mask = 0x02, .duration_ns = GCL_SLOT_NS }, /* slot 1: solo cola 1 */
+	{ .gate_mask = 0x01, .duration_ns = 9000000 }, /* slot 0: solo cola 0, 9ms */
+	{ .gate_mask = 0x02, .duration_ns = 1000000 }, /* slot 1: solo cola 1, 1ms */
 };
 #define GCL_LEN (sizeof(gcl) / sizeof(gcl[0]))
 
 static struct xdp_program *prog[MAX_SOCKS]; // un programa XDP por socket
 int xsk_map_fd[MAX_SOCKS];
+static int ts_map_fd_global = -1;
 bool custom_xsk = false;
 
 // Configuración de esta ejecución
@@ -149,6 +148,19 @@ struct gcl_args {
     struct xsk_socket_info *xsk_sockets[MAX_SOCKS];
 };
 
+/* Registro de timestamp sincronizado con af_xdp_kern.c */
+struct ts_record {
+    __u64 ts_ns;
+    __u16 pkt_seq;   /* numero de secuencia ICMP (no usar icmp_seq: es macro en netinet/ip_icmp.h) */
+    __u16 vlan_id;
+};
+
+struct ts_args {
+    struct ring_buffer *rb;
+};
+
+static FILE *ts_outfile;
+
 static const char *__doc__ __attribute__((unused)) = "AF_XDP kernel bypass example\n";
 
 static const struct option_wrapper __attribute__((unused))long_options[] = {
@@ -197,6 +209,25 @@ static const struct option_wrapper __attribute__((unused))long_options[] = {
 
 // atómica para que sea visible entre cores
 static atomic_bool global_exit;
+
+static int ts_callback(void *ctx, void *data, size_t size)
+{
+    (void)ctx; (void)size;
+    struct ts_record *rec = data;
+    if (ts_outfile)
+        fprintf(ts_outfile, "%u,%llu,%u\n", rec->pkt_seq,
+                (unsigned long long)rec->ts_ns, rec->vlan_id);
+    return 0;
+}
+
+static void *ts_thread(void *arg)
+{
+    struct ts_args *targs = arg;
+    while (!global_exit)
+        ring_buffer__poll(targs->rb, 100);
+    ring_buffer__poll(targs->rb, 0);
+    return NULL;
+}
 
 // Función para configurar la UMEM
 static struct xsk_umem_info *configure_xsk_umem(void *buffer, uint64_t size)
@@ -485,7 +516,7 @@ static void process_packet(struct xsk_socket_info *xsk_in, struct xsk_socket_inf
 
 	struct ethhdr *eth = (struct ethhdr *) pkt;
 	uint16_t proto = ntohs(eth->h_proto);
-	uint16_t vlan_id = 0;
+	uint8_t  pcp = 0;
 	size_t l3_offset = sizeof(struct ethhdr);
 
 	// Parseo de etiqueta 802.1Q
@@ -493,10 +524,11 @@ static void process_packet(struct xsk_socket_info *xsk_in, struct xsk_socket_inf
 		if (len < sizeof(struct ethhdr) + sizeof(struct vlan_hdr))
 			return;
 		struct vlan_hdr *vhdr = (struct vlan_hdr *)(pkt + sizeof(struct ethhdr));
-		vlan_id = ntohs(vhdr->h_vlan_TCI) & 0x0FFF;
+		uint16_t tci = ntohs(vhdr->h_vlan_TCI);
+		pcp     = (tci >> 13) & 0x07;   /* bits 15-13: Priority Code Point */
 		proto   = ntohs(vhdr->h_vlan_encapsulated_proto);
 		l3_offset += sizeof(struct vlan_hdr);
-		printf("[VLAN] ID=%u  cola=%u\n", vlan_id, vlan_id > 0 ? (vlan_id - 1) % NUM_TX_QUEUES : 0);
+		printf("[VLAN] PCP=%u  cola=%u\n", pcp, pcp);
 	}
 
 	if (proto != ETH_P_IP && proto != ETH_P_ARP)
@@ -530,9 +562,8 @@ forward:
 	// Copiamos el paquete al frame de la UMEM del socket de salida
 	memcpy(xsk_umem__get_data(xsk_out->umem->buffer, tx_addr), pkt, len);
 
-	// Encolamos en la cola software según el VLAN ID; el hilo GCL se encargará de enviarlo al kernel
-	// VLAN 1 → cola 0, VLAN 2 → cola 1, sin VLAN (vlan_id=0) → cola 0
-	int q = vlan_id > 0 ? (vlan_id - 1) % NUM_TX_QUEUES : 0;
+	/* PCP 0-7 mapea directamente al índice de cola 0-7 (IEEE 802.1Q) */
+	int q = pcp;
 	if (!sw_queue_enqueue(&xsk_out->sw_queues[q], tx_addr, len)) {
 		// Cola llena: liberamos el frame que acabamos de reservar
 		xsk_free_umem_frame(xsk_out, tx_addr);
@@ -749,11 +780,14 @@ static void *gcl_thread(void *arg)
             complete_tx(xsk);
         }
 
-        /* Dormimos hasta el final del slot actual */
+        /* Dormimos un intervalo corto para drenar frecuentemente dentro del slot.
+         * Si el slot termina antes, dormimos solo lo que queda. */
+        #define GCL_POLL_NS 100000ULL  /* 100 µs */
         uint64_t remaining_ns = slot_start + gcl[slot].duration_ns - pos;
+        uint64_t sleep_ns = remaining_ns < GCL_POLL_NS ? remaining_ns : GCL_POLL_NS;
         struct timespec sleep_ts = {
-            .tv_sec  = remaining_ns / 1000000000ULL,
-            .tv_nsec = remaining_ns % 1000000000ULL,
+            .tv_sec  = sleep_ns / 1000000000ULL,
+            .tv_nsec = sleep_ns % 1000000000ULL,
         };
         nanosleep(&sleep_ts, NULL);
     }
@@ -774,7 +808,19 @@ static void exit_application(int signal)
 }
 
 int main(int argc, char **argv)
-{	
+{
+	/* Interfaces configurables: ./af_xdp_user [iface1 iface2]
+	 * Si no se pasan argumentos se usan los valores por defecto (s1-eth1, s1-eth2). */
+	if (argc == 3) {
+		strncpy(cfgs[0].ifname_buf, argv[1], IF_NAMESIZE - 1);
+		cfgs[0].ifname = cfgs[0].ifname_buf;
+		strncpy(cfgs[1].ifname_buf, argv[2], IF_NAMESIZE - 1);
+		cfgs[1].ifname = cfgs[1].ifname_buf;
+	} else if (argc != 1) {
+		fprintf(stderr, "Uso: %s [iface1 iface2]\n", argv[0]);
+		return EXIT_FAIL;
+	}
+
 	void *packet_buffer[MAX_SOCKS]; // dirección de inicio de la UMEM
 	uint64_t packet_buffer_size; // tamaño de la UMEM
 	// establecemos como infinito el límite de memoria que se puede bloquear para que no sea swapeada
@@ -852,6 +898,22 @@ int main(int argc, char **argv)
 				fprintf(stderr, "ERROR: no xsks map found: %s\n",
 					strerror(xsk_map_fd[i]));
 				exit(EXIT_FAILURE);
+			}
+
+			/* Obtenemos el fd de ts_map solo del primer programa (interfaz de entrada) */
+			if (i == 0) {
+				struct bpf_map *ts_map_obj =
+					bpf_object__find_map_by_name(xdp_program__bpf_obj(prog[i]), "ts_map");
+				if (ts_map_obj) {
+					int ts_fd = bpf_map__fd(ts_map_obj);
+					char ts_path[128];
+					snprintf(ts_path, sizeof(ts_path), "/tmp/ts_%s.csv", cfgs[0].ifname);
+					ts_outfile = fopen(ts_path, "w");
+					if (ts_outfile) {
+						fprintf(ts_outfile, "icmp_seq,ts_ns,vlan_id\n");
+						ts_map_fd_global = ts_fd;
+					}
+				}
 			}
 		}
 	}
@@ -932,10 +994,27 @@ int main(int argc, char **argv)
 		gargs.xsk_sockets[i] = xsk_socket[i];
 	pthread_create(&gcl_tid, NULL, gcl_thread, &gargs);
 
+	// Creamos el hilo de timestamps (si se obtuvo el fd de ts_map)
+	pthread_t ts_tid;
+	struct ts_args targs_ts = {0};
+	if (ts_map_fd_global >= 0 && ts_outfile) {
+		targs_ts.rb = ring_buffer__new(ts_map_fd_global, ts_callback, NULL, NULL);
+		if (targs_ts.rb)
+			pthread_create(&ts_tid, NULL, ts_thread, &targs_ts);
+		else
+			fprintf(stderr, "WARN: no se pudo crear ring_buffer para timestamps\n");
+	}
+
 	// Esperamos a que todos los hilos terminen (cuando global_exit = true)
 	for (int i = 0; i < MAX_SOCKS; i++)
 		pthread_join(threads[i], NULL);
 	pthread_join(gcl_tid, NULL);
+	if (targs_ts.rb) {
+		pthread_join(ts_tid, NULL);
+		ring_buffer__free(targs_ts.rb);
+	}
+	if (ts_outfile)
+		fclose(ts_outfile);
 
 	// Limpiamos los sockets
 	for (int i = 0; i < MAX_SOCKS; i++) {

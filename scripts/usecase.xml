@@ -1,0 +1,30 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<usecase>
+
+  <!-- TAS: ciclo y GCL comunes a todos los bridges -->
+  <tas>
+    <cycle_ns>10000000</cycle_ns> <!-- 10 ms -->
+    <gcl>
+      <!-- 7 ms: solo VLAN 100 (trafico TSN critico, PCP=0) -->
+      <entry gate_mask="0x01" duration_ns="7000000"/>
+      <!-- 3 ms: solo VLAN 101 (best effort, PCP=1) -->
+      <entry gate_mask="0x02" duration_ns="3000000"/>
+    </gcl>
+  </tas>
+
+  <!-- Cadena de bridges: H1 - BR1(s1) - BR2(s2) - BR3(s3) - H2
+       offset_ns: retraso de apertura de ventana respecto al inicio del ciclo,
+       para compensar la propagacion entre bridges -->
+  <bridges>
+    <bridge id="1" iface1="s1-eth1" iface2="s1-eth2" offset_ns="0"/>
+    <bridge id="2" iface1="s2-eth1" iface2="s2-eth2" offset_ns="1000000"/>
+    <bridge id="3" iface1="s3-eth1" iface2="s3-eth2" offset_ns="2000000"/>
+  </bridges>
+
+  <!-- Hosts terminales -->
+  <hosts>
+    <host name="h1" ip_vlan100="10.0.0.1/24" ip_vlan101="10.0.1.1/24"/>
+    <host name="h2" ip_vlan100="10.0.0.2/24" ip_vlan101="10.0.1.2/24"/>
+  </hosts>
+
+</usecase>

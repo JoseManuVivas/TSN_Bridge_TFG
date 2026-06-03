@@ -366,13 +366,280 @@ Lo que controlará el TAS no es cuándo se copia, sino cuándo se hace el `submi
 **Objetivo:** Implementar las dos colas, con las funciones correspondientes para que los paquetes, al copiarse al frame de salida, se encolen en ella y esperen a que su ventana de tiempo se abra.
 
 #### Notas técnicas
-¿Cómo lo haremos? Actualmente, en la función ```process_packet```, cuando copiamos un frame en la UMEM del socket de salida, directamente añadimos su descriptor al TX ring de salida, lo que hace que nada más copiarse, se pretende reenviar. Nosotros no buscamos eso ahora, queremos que al copiarse en la UMEM del socket de salida, el descriptor del frame se retenga en la cola, hasta que sea el momento de abrirse. Para ello, en ```xsk_socket_info``` añadiremos colas software en memoria de espacio de usuario. Cada cola será un array circular de descriptores.
 
-Inicialmente, definimos la estructura ```sw_queue``` que se asociarán (una por VLANs configuradas) a ```xsk_socket_info```. Esta estructura es una cola circular sencilla con *head* y *tail*, de ```xdp_desc```.
+##### Arquitectura de colas software
 
-No hace falta inicializar `head` y `tail` de las colas, ya que ```calloc``` ya inicializa todos los bytes a 0.
+Actualmente, en `process_packet`, cuando copiamos un frame en la UMEM del socket de salida, directamente añadimos su descriptor al TX ring de salida. Con el TAS queremos retener ese descriptor en una cola hasta que su ventana de tiempo se abra.
 
-Añadimos un campo ```drops``` a la estructura ```sw_queue``` que contará los paquetes que se descarten por cola llena.
+Flujo nuevo:
+```
+RX ring → process_packet() → sw_queue (según VLAN) → hilo GCL → TX ring kernel
+```
 
-Para implementar la GCL, consideraremos cada entrada de la tabla como una "ventana de tiempo", que estará compuesta por su duración en milisegundos y una bitmask que especifica las colas que están abiertas en esa ventana.
+##### struct sw_queue — cola SPSC lock-free
+
+Diseño SPSC (Single Producer, Single Consumer): el hilo RX es el único productor, el hilo GCL el único consumidor. Con variables `_Atomic` no hace falta mutex, lo que evita bloqueos en el camino de datos.
+
+```c
+struct sw_queue {
+    struct xdp_desc ring[NUM_FRAMES];  // reutilizamos xdp_desc de libxdp
+    _Atomic uint32_t head;   // solo el productor escribe aquí
+    _Atomic uint32_t tail;   // solo el consumidor escribe aquí
+    _Atomic uint32_t drops;  // paquetes descartados por cola llena
+};
+```
+
+`head` y `tail` nunca decrementan — la posición real en el array se obtiene con `% NUM_FRAMES`. La cola está vacía cuando `head == tail` y llena cuando `head - tail >= NUM_FRAMES`.
+
+**Memory ordering:** el productor lee `tail` con `acquire` (para ver los huecos liberados por el consumidor) y escribe `head` con `release` (para que el consumidor vea el slot escrito). El consumidor hace lo simétrico. La regla general: el que escribe una variable usa `release`; el que lee lo que otro escribe usa `acquire`. Las variables que solo toca un hilo se leen con `relaxed`.
+
+No hace falta inicializar `head`, `tail` ni `drops` ya que `calloc` inicializa todos los bytes a 0.
+
+Si la cola está llena, el paquete se descarta (drop silencioso) y se incrementa `drops`. Es la decisión correcta para TSN: un paquete que no cabe en su ventana ya llegará tarde de todas formas. El contador `drops` permite diagnosticar si el GCL está bien dimensionado.
+
+##### struct gcl_entry — Gate Control List
+
+Cada entrada representa una ventana de tiempo:
+
+```c
+struct gcl_entry {
+    uint8_t  gate_mask;   // bitmask: bit N = cola N abierta
+    uint64_t duration_ns;
+};
+```
+
+Con `uint8_t` soportamos hasta 8 colas, que es exactamente lo que define IEEE 802.1Qbv. La tabla GCL es un array estático que se repite cíclicamente. La duración de cada slot se define con `#define GCL_SLOT_NS` para poder ajustarla sin tocar la lógica.
+
+Tabla inicial (ciclo de 2ms):
+```
+slot 0: gate_mask=0x01 (cola 0 abierta) — 1ms
+slot 1: gate_mask=0x02 (cola 1 abierta) — 1ms
+```
+
+##### Hilo GCL
+
+Un tercer hilo (además de los dos de RX) implementa el ejecutivo cíclico:
+
+1. Lee `CLOCK_TAI` — el reloj que exige TSN porque no tiene saltos de segundo como `CLOCK_REALTIME`.
+2. Calcula la posición dentro del ciclo: `pos = now_ns % cycle_ns`.
+3. Busca el slot activo recorriendo la tabla GCL acumulando duraciones.
+4. Para cada socket y cada cola cuyo bit esté abierto en `gate_mask`, drena la cola hacia el TX ring del kernel.
+5. Llama a `complete_tx` para reciclar frames de la CQ.
+6. Duerme con `nanosleep` hasta el final del slot actual.
+
+**Guardia de tiempo dentro del drenado:** antes de enviar cada frame se comprueba si el slot sigue activo:
+```c
+if (pos2 >= slot_start + gcl[slot].duration_ns || pos2 < slot_start)
+    // slot expirado → descartar frame y parar
+```
+La segunda condición (`pos2 < slot_start`) es necesaria para detectar el wraparound del último slot: cuando el ciclo da la vuelta, `pos2` salta a 0, que es menor que `slot_start` del último slot. Sin esta condición, el último slot nunca expiraría.
+
+Si el TX ring del kernel está lleno al intentar enviar, el frame se descarta y se para el drenado de esa cola.
+
+##### Bugs encontrados y corregidos
+
+1. **Race condition en `complete_tx`**: `handle_receive_packets` seguía llamando a `complete_tx(xsk_out)` aunque el TX ring ya no lo tocaba. El hilo GCL también llamaba a `complete_tx` sobre los mismos sockets → acceso concurrente a `xsk->cq` y `xsk->outstanding_tx`. Solución: eliminar la llamada de `handle_receive_packets`.
+
+2. **Wraparound del último slot en la guardia de tiempo**: la condición `pos2 >= slot_start + duration` nunca se cumple para el último slot porque `slot_start + duration == cycle_ns` y `pos2` siempre es menor que `cycle_ns`. Solución: añadir `|| pos2 < slot_start`.
+
+3. **Mapeo VLAN → cola invertido**: `vlan_id % NUM_TX_QUEUES` da VLAN 1 → cola 1 y VLAN 2 → cola 0. Corregido con `(vlan_id - 1) % NUM_TX_QUEUES` para que VLAN 1 → cola 0 y VLAN 2 → cola 1.
+
+4. **`clock_gettime` sin verificar**: si fallara, `now_ns` sería basura y el slot calculado incorrecto. Añadida verificación del retorno en ambas llamadas del hilo GCL.
+
+5. **`printf` en el camino caliente**: varios prints por paquete en `process_packet` que bloquean en el buffer de stdout, destruyendo la latencia. Eliminados; solo queda el print de clasificación VLAN para depuración.
+
+##### Topología actualizada
+
+`topo.py` ahora crea hosts con **dos interfaces VLAN** cada uno:
+- `h1-eth0.1` → 10.0.0.1/24 (VLAN 1, cola 0)
+- `h1-eth0.2` → 10.0.1.1/24 (VLAN 2, cola 1)
+- `h2-eth0.1` → 10.0.0.2/24 (VLAN 1, cola 0)
+- `h2-eth0.2` → 10.0.1.2/24 (VLAN 2, cola 1)
+
+Esto permite dos flujos concurrentes entre los mismos hosts, cada uno en una VLAN distinta, para verificar el gating del TAS.
+
+##### Verificación
+
+Prueba realizada con dos pings concurrentes desde h1:
+```
+h1 ping 10.0.0.2   # VLAN 1 → cola 0
+h1 ping 10.0.1.2   # VLAN 2 → cola 1
+```
+
+Resultado: ambos flujos llegan a destino. La salida del bridge muestra clasificación correcta:
+```
+[VLAN] ID=1  cola=0
+[VLAN] ID=2  cola=1
+```
+
+Se observan picos de latencia esporádicos, esperables en Mininet con SKB mode por tres motivos:
+- Un paquete que llega justo cuando su slot se cierra espera hasta el siguiente ciclo (≤2ms)
+- `nanosleep` no es exacto sin `SCHED_FIFO`/`SCHED_RR`
+- SKB mode añade variabilidad inherente al pasar por el stack del kernel
+
+En hardware real con XDP nativo y `PREEMPT_RT` los picos serían predecibles y periódicos.
+
+## Sesión [20-05-2026]
+### Medición de latencia del TAS
+**Objetivo:** Demostrar cuantitativamente que el GCL gatea el tráfico correctamente: medir la distribución de RTT de dos flujos VLAN concurrentes y verificar que la latencia de cada flujo refleja el comportamiento esperado del TAS.
+
+#### Tareas realizadas
+
+- Diseño e implementación del script `scripts/analyze_latency.py` para analizar la salida de hping3
+- Identificación y corrección del bug de hping3 sin interfaz explícita (raw sockets no aplican etiqueta VLAN)
+- Primera prueba con GCL simétrico (1ms/1ms): gating no observable por encima del ruido de Mininet
+- Identificación del bug de latencia excesiva al pasar a GCL asimétrico (9ms/1ms): el hilo GCL dormía el slot completo
+- Corrección del hilo GCL: polling cada 100µs en lugar de dormir hasta el final del slot
+- Prueba definitiva con GCL asimétrico (9ms/1ms): diferencia de medias de 5ms, gating demostrado
+
+#### Notas técnicas
+
+##### Diseño del experimento
+
+Se eligió `hping3` sobre `ping` por dos motivos: permite enviar a frecuencia arbitraria (`-i u700` = cada 700µs) y da el RTT de cada paquete individual en la salida, facilitando el análisis estadístico.
+
+La frecuencia de 700µs es incomensurable con el ciclo GCL (10ms), por lo que los paquetes barren todas las fases del ciclo y la distribución observada refleja el comportamiento real del gating.
+
+**Incidencia con hping3:** cuando se lanza sin especificar interfaz (`-I`), hping3 usa raw sockets y no pasa por la interfaz VLAN del kernel (`h1-eth0.2`), por lo que el paquete sale sin etiqueta VLAN 2. El bridge lo clasifica como VLAN 0 → cola 0, y h2 no puede responder (no tiene IP sin etiquetar). Solución: forzar la interfaz con `-I h1-eth0.1` y `-I h1-eth0.2`.
+
+##### Bug: hilo GCL dormía el slot completo
+
+Con GCL simétrico (1ms/slot) este comportamiento era aceptable: un paquete esperaba como mucho 1ms. Al cambiar a slots asimétricos (9ms/1ms), los paquetes de VLAN 1 debían esperar hasta 9ms aunque su gate estuviese abierto, porque el hilo GCL drenaba al inicio del slot y luego dormía 9ms sin volver a drenar.
+
+Resultado: VLAN 1 pasó de ~3ms a ~16ms de media, peor que antes.
+
+**Solución:** en lugar de dormir hasta el final del slot, el hilo GCL duerme en intervalos cortos de 100µs (`GCL_POLL_NS`) y vuelve a drenar en cada iteración. Si el slot termina antes de los 100µs, duerme solo lo que queda:
+
+```c
+#define GCL_POLL_NS 100000ULL  /* 100 µs */
+uint64_t remaining_ns = slot_start + gcl[slot].duration_ns - pos;
+uint64_t sleep_ns = remaining_ns < GCL_POLL_NS ? remaining_ns : GCL_POLL_NS;
+```
+
+Con esto, un paquete espera como máximo 100µs dentro de su slot antes de ser enviado. El gate sigue controlando qué cola puede transmitir — solo cambia la granularidad del polling.
+
+##### GCL asimétrico para demostrar el gating
+
+Para que el efecto del gating sea visible por encima del ruido de Mininet (~2ms de variabilidad en SKB mode), se configuró el GCL con slots muy asimétricos:
+
+```c
+static const struct gcl_entry gcl[] = {
+    { .gate_mask = 0x01, .duration_ns = 9000000 }, /* slot 0: cola 0, 9ms */
+    { .gate_mask = 0x02, .duration_ns = 1000000 }, /* slot 1: cola 1, 1ms */
+};
+```
+
+Cola 0 (VLAN 1) tiene gate abierto el 90% del ciclo → los paquetes esperan como mucho 100µs → latencia baja.
+Cola 1 (VLAN 2) tiene gate abierto solo el 10% del ciclo → un paquete que llega en mal momento espera hasta 9ms → latencia alta y variable.
+
+##### Resultados — GCL simétrico 1ms/1ms (experimento previo)
+
+Con slots iguales de 1ms, la variabilidad de Mininet (rango ~4ms) superaba la duración del slot, haciendo invisible el efecto del gating. Ambos flujos mostraban distribuciones similares (~3-6ms).
+
+##### Resultados — GCL asimétrico 9ms/1ms (experimento definitivo)
+
+| Métrica | VLAN 1 (cola 0, 9ms) | VLAN 2 (cola 1, 1ms) |
+|---|---|---|
+| Muestras | 999 | 1000 |
+| Mínimo | 0.2ms | 0.4ms |
+| Media | 2.4ms | 7.4ms |
+| p50 | 1.4ms | 5.3ms |
+| p95 | 2.4ms | 9.9ms |
+| p99 | 3.1ms | 10.7ms |
+| Máximo | ~3.4ms* | ~11ms* |
+| Outliers (timeout) | 1 | 2 |
+
+*excluyendo timeouts de hping3 (~1000ms)
+
+**Diferencia de medias: 5ms.**
+
+##### Interpretación
+
+La diferencia de 5ms entre las medias está muy por encima del ruido de Mininet (~2ms). Esto demuestra inequívocamente que el GCL está gateando el tráfico de forma diferenciada por cola.
+
+VLAN 1 muestra una distribución compacta (0.2-3.4ms) porque su gate está abierto el 90% del tiempo y el polling de 100µs garantiza que los paquetes se envían rápidamente en cuanto llegan.
+
+VLAN 2 muestra una distribución muy ancha (0.4-11ms) con media 5ms más alta: la mayoría de paquetes llegan durante los 9ms en que su gate está cerrado y tienen que esperar hasta el siguiente slot de 1ms.
+
+No se observa distribución bimodal limpia porque el ruido de Mininet en SKB mode (~2ms de variabilidad) difumina los dos modos teóricos. En hardware real con XDP nativo y latencia base <100µs, el efecto sería un desplazamiento limpio de ~9ms entre los dos picos.
+
+Los outliers (~1000ms) son paquetes descartados por la guardia de tiempo del GCL (slot expirado durante el drenado) o por el TX ring lleno, en los que hping3 agota su timeout de 1 segundo.
+
+#### Comandos clave
+```bash
+# Lanzar los dos flujos concurrentes desde xterm de h1
+hping3 -1 -I h1-eth0.1 -i u700 -c 1000 10.0.0.2 > ~/vlan1.txt 2>&1 & \
+hping3 -1 -I h1-eth0.2 -i u700 -c 1000 10.0.1.2 > ~/vlan2.txt 2>&1 & \
+wait
+
+# Copiar resultados y analizar
+cp ~/vlan1.txt ~/vlan2.txt /ruta/al/proyecto/
+python3 scripts/analyze_latency.py vlan1.txt vlan2.txt
+```
+
+## Sesión [23-05-2026]
+### Clasificación por PCP y nueva topología
+
+**Objetivo:** Cambiar la clasificación de tráfico de VLAN ID a campo PCP (conforme al estándar IEEE 802.1Q) y adaptar la topología de Mininet para generar tráfico con distintos valores de PCP.
+
+#### Tareas realizadas
+
+- Cambio de clasificación en `af_xdp_user.c`: de VLAN ID a PCP
+- `NUM_TX_QUEUES` ampliado de 2 a 8 (conforme al estándar, 3 bits PCP = 8 clases)
+- Rediseño de `topo.py` para marcar PCP mediante `egress-qos-map`
+- Actualización de etiquetas en `analyze_latency.py` (VLAN 1/2 → PCP=0/PCP=1)
+- Experimento de validación repetido con la nueva clasificación
+
+#### Notas técnicas
+
+##### Cambio de VLAN ID a PCP
+
+El director confirmó que la clasificación de tráfico debe hacerse por el campo **PCP** (Priority Code Point) de la etiqueta 802.1Q, no por el VLAN ID. PCP ocupa los 3 bits más significativos del campo TCI y toma valores 0-7, que mapean directamente a las 8 colas del estándar IEEE 802.1Q.
+
+Cambio en `process_packet`:
+```c
+/* Antes */
+vlan_id = ntohs(vhdr->h_vlan_TCI) & 0x0FFF;
+int q = vlan_id > 0 ? (vlan_id - 1) % NUM_TX_QUEUES : 0;
+
+/* Ahora */
+uint8_t pcp = (ntohs(vhdr->h_vlan_TCI) >> 13) & 0x07;
+int q = pcp;  /* PCP 0-7 mapea directamente a cola 0-7 */
+```
+
+`NUM_TX_QUEUES` se amplió a 8 para representar el estándar completo. Para el experimento del TFG solo se usan las colas 0 y 1; las colas 2-7 existen pero el GCL nunca abre sus puertas.
+
+##### Topología: marcado de PCP con egress-qos-map
+
+Para generar tráfico con PCP=0 y PCP=1 desde hping3 (que no permite configurar PCP directamente) se exploró el uso de `tc skbedit priority` sobre una interfaz VLAN única, pero falló por módulos del kernel no disponibles en el entorno.
+
+Solución adoptada: **dos interfaces VLAN con distintos VLAN IDs, cada una con `egress-qos-map` fijo**:
+- `h1-eth0.100` con `egress-qos-map 0:0` → todo el tráfico sale con PCP=0
+- `h1-eth0.101` con `egress-qos-map 0:1` → todo el tráfico sale con PCP=1
+
+El mecanismo `egress-qos-map` del driver VLAN de Linux traduce `skb->priority` al campo PCP de la etiqueta 802.1Q al construirla. Con `0:1` se fuerza que cualquier paquete (que tiene `skb->priority=0` por defecto) salga con PCP=1. El bridge clasifica por PCP, no por VLAN ID, así que el resultado es funcionalmente equivalente a tener una sola VLAN con dos clases de tráfico.
+
+##### Resultados — GCL asimétrico 9ms/1ms con clasificación por PCP
+
+| Métrica | PCP=0 (cola 0, 9ms) | PCP=1 (cola 1, 1ms) |
+|---|---|---|
+| Muestras | 1000 | 999 |
+| Mínimo | 0.2ms | 0.4ms |
+| Media | 2.5ms | 6.9ms |
+| p50 | 1.5ms | 6.0ms |
+| p95 | 3.0ms | 10.4ms |
+| p99 | 3.5ms | 11.3ms |
+
+**Diferencia de medias: 4.4ms.** El gating se demuestra con la nueva clasificación por PCP. Histograma de PCP=1 uniforme entre 0 y 11ms (firma del gating: todos los tiempos de espera son equiprobables dentro del ciclo de 10ms).
+
+#### Comandos clave
+```bash
+# Lanzar los dos flujos concurrentes desde xterm de h1
+hping3 -1 -I h1-eth0.100 10.0.0.2 -i u700 -c 1000 > /tmp/pcp0.txt 2>&1 &
+hping3 -1 -I h1-eth0.101 10.0.1.2 -i u700 -c 1000 > /tmp/pcp1.txt 2>&1 &
+wait
+
+# Analizar resultados
+python3 scripts/analyze_latency.py
+```
 
