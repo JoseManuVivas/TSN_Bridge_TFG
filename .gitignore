@@ -31,6 +31,10 @@ venv/
 # Carpeta de construcción
 build/
 
+# --- Resultados e imágenes generadas ---
+results/
+Imagenes/
+
 # --- Editores y Sistema ---
 .vscode/
 .idea/
